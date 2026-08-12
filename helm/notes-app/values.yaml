@@ -1,9 +1,9 @@
 replicaCount: 1
 
-image:
-  repository: notes-app
-  tag: latest
-  pullPolicy: IfNotPresent
+# image.repository / image.tag are rewritten by the Jenkins "Update GitOps
+# manifest" stage. Do not hand-edit; Argo CD syncs whatever lands here.
+image: docker.io/jahadulrakib/notes-app:latest
+imagePullPolicy: IfNotPresent
 
 service:
   type: ClusterIP

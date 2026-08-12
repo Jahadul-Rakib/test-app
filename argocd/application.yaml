@@ -1,0 +1,33 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: notes-app
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/Jahadul-Rakib/test-app.git
+    targetRevision: main
+    path: helm/notes-app
+    helm:
+      valueFiles:
+        - values.yaml
+  destination:
+    # in-cluster: Argo CD runs inside the private cluster and talks to the
+    # local API server, so nothing outside the network needs API access.
+    server: https://kubernetes.default.svc
+    namespace: default
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+    retry:
+      limit: 5
+      backoff:
+        duration: 10s
+        factor: 2
+        maxDuration: 3m
