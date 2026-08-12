@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Notes</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 640px; margin: 3rem auto; padding: 0 1rem; }
+    h1 { font-size: 1.5rem; }
+    form.add { display: flex; gap: .5rem; margin-bottom: 1.5rem; }
+    input[type=text] { flex: 1; padding: .5rem; border: 1px solid #ccc; border-radius: 4px; }
+    button { padding: .5rem .9rem; border: 0; border-radius: 4px; background: #2d6cdf; color: #fff; cursor: pointer; }
+    ul { list-style: none; padding: 0; }
+    li { display: flex; justify-content: space-between; align-items: center; gap: 1rem;
+         padding: .6rem .8rem; border: 1px solid #eee; border-radius: 4px; margin-bottom: .4rem; }
+    li button { background: #d33; }
+    .empty { color: #888; }
+  </style>
+</head>
+<body>
+  <h1>Notes</h1>
+
+  <form class="add" method="post" action="{{ url_for('add') }}">
+    <input type="text" name="note" placeholder="Write a note..." autofocus>
+    <button type="submit">Add</button>
+  </form>
+
+  {% if notes %}
+    <ul>
+      {% for note in notes %}
+        <li>
+          <span>{{ note }}</span>
+          <form method="post" action="{{ url_for('delete', idx=loop.index0) }}">
+            <button type="submit">Delete</button>
+          </form>
+        </li>
+      {% endfor %}
+    </ul>
+  {% else %}
+    <p class="empty">No notes yet.</p>
+  {% endif %}
+</body>
+</html>

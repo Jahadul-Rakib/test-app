@@ -1,0 +1,6 @@
+apiVersion: v2
+name: notes-app
+description: A tiny single-page notes app
+type: application
+version: 0.1.0
+appVersion: "1.0.0"
