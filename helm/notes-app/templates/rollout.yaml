@@ -1,0 +1,67 @@
+{{- /*
+Rollout replaces the Deployment. Same pod spec -- the difference is that the
+Argo Rollouts controller owns the ReplicaSets and steps through the canary
+instead of doing an all-at-once rolling update.
+
+Requires the Argo Rollouts controller and its CRDs in the cluster. Without them
+Argo CD fails to sync with `no matches for kind "Rollout"`.
+
+Argo CD understands Rollout health natively (it ships a health check for
+argoproj.io resources), so a paused canary shows as Progressing, not Degraded.
+*/ -}}
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: {{ include "notes-app.fullname" . }}
+  labels:
+    {{- include "notes-app.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  revisionHistoryLimit: {{ .Values.rollout.revisionHistoryLimit }}
+  selector:
+    matchLabels:
+      {{- include "notes-app.selectorLabels" . | nindent 6 }}
+  strategy:
+    canary:
+      {{- if .Values.rollout.trafficRouting.enabled }}
+      # With a traffic router, setWeight is a real percentage of requests.
+      # Rollouts mutates these two Services' selectors at runtime to steer
+      # traffic -- see ignoreDifferences in argocd/application.yaml.
+      stableService: {{ include "notes-app.fullname" . }}
+      canaryService: {{ include "notes-app.fullname" . }}-canary
+      trafficRouting:
+        nginx:
+          stableIngress: {{ include "notes-app.fullname" . }}
+      {{- end }}
+      maxSurge: {{ .Values.rollout.maxSurge }}
+      maxUnavailable: {{ .Values.rollout.maxUnavailable }}
+      steps:
+        {{- toYaml .Values.rollout.canary.steps | nindent 8 }}
+  template:
+    metadata:
+      labels:
+        {{- include "notes-app.selectorLabels" . | nindent 8 }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: {{ .Chart.Name }}
+          image: "{{ .Values.image }}"
+          imagePullPolicy: "{{ .Values.imagePullPolicy }}"
+          ports:
+            - name: http
+              containerPort: {{ .Values.service.targetPort }}
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 3
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}

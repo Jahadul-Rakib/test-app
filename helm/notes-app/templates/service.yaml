@@ -1,3 +1,8 @@
+{{- /*
+The stable Service. When traffic routing is on, the Rollouts controller
+rewrites this selector during a canary to point at the stable ReplicaSet.
+Do not add rollouts-pod-template-hash here -- the controller manages it.
+*/ -}}
 apiVersion: v1
 kind: Service
 metadata:
@@ -13,3 +18,26 @@ spec:
       name: http
   selector:
     {{- include "notes-app.selectorLabels" . | nindent 4 }}
+{{- if .Values.rollout.trafficRouting.enabled }}
+---
+{{- /*
+Canary Service. Only needed with traffic routing: nginx splits between this
+and the stable Service by weight. Without it, canary weight is approximated by
+replica count and one Service is enough.
+*/ -}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "notes-app.fullname" . }}-canary
+  labels:
+    {{- include "notes-app.labels" . | nindent 4 }}
+spec:
+  type: {{ .Values.service.type }}
+  ports:
+    - port: {{ .Values.service.port }}
+      targetPort: http
+      protocol: TCP
+      name: http
+  selector:
+    {{- include "notes-app.selectorLabels" . | nindent 4 }}
+{{- end }}

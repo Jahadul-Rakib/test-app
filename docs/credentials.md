@@ -165,7 +165,7 @@ answers "who wrote this manifest"; image signing answers "who built this
 image".
 
 Image verification happens at **admission**, when the pod is created. Argo CD
-applies the Deployment, the API server calls an admission webhook, and that
+applies the Rollout, the API server calls an admission webhook, and that
 webhook rejects the pod if the image is unsigned. Two implementations:
 Sigstore policy-controller, or Kyverno. Kyverno shown here.
 

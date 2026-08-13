@@ -306,7 +306,7 @@ pipeline {
             }
         }
 
-        // Deployment is a git commit, not a kubectl call. Argo CD runs inside
+        // Deploying is a git commit, not a kubectl call. Argo CD runs inside
         // the private cluster and pulls this change, so Jenkins never needs a
         // route to the API server.
         stage('Update GitOps') {

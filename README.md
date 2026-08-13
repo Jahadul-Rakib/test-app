@@ -31,7 +31,7 @@ every step is *pull*-based rather than push-based.
     ║  CLUSTER     │           │ Argo CD  │ renders chart, applies it     ║
     ║              │           └────┬─────┘                               ║
     ║              │                ▼                                     ║
-    ║              │           Deployment ──► Pod                         ║
+    ║              │           Rollout ──► canary + stable pods          ║
     ║              │                            ▲                         ║
     ║              └──kubelet pulls image───────┘                         ║
     ║                                                                     ║
@@ -49,7 +49,7 @@ Instead Jenkins commits the new image tag to `values.yaml`, and Argo CD, running
 Argo CD. Both poll instead, each on a 60s interval. Worst case from `git push`
 to a running pod is roughly 4–6 minutes, most of it the actual build.
 
-**Why image tags are git SHAs.** A Deployment is only re-applied when its spec
+**Why image tags are git SHAs.** A workload is only re-applied when its spec
 changes. With a mutable tag like `latest` the rendered manifest is byte-identical
 every build, Argo CD sees no diff, and nothing ever redeploys. Immutable tags are
 what make GitOps work at all.
@@ -67,7 +67,7 @@ forever. The write-back commit is stamped `[ci skip]`, and every stage carries
 | `app.py`, `templates/` | The Flask app |
 | `Dockerfile` | Runtime image |
 | `Jenkinsfile` | The CI pipeline |
-| `helm/notes-app/` | The chart Argo CD renders |
+| `helm/notes-app/` | The chart Argo CD renders (a Rollout, not a Deployment) |
 | `argocd/application.yaml` | Tells Argo CD what to watch |
 | `argocd/repo-secret.sh` | Credential Argo CD clones with |
 | `docs/kubernetes/dockerhub-pull-secret.sh` | Credential the kubelet pulls with |
@@ -143,6 +143,91 @@ kubectl -n argocd run nettest --rm -it --restart=Never \
 
 `401` means success (the endpoint requires auth; you reached it). A timeout
 means no egress, and you would need an internal registry and git mirror instead.
+
+## Canary deployment (Argo Rollouts)
+
+The workload is a **Rollout**, not a Deployment. The Argo Rollouts controller
+owns the ReplicaSets and steps a new image through a canary instead of
+replacing everything at once.
+
+### Install the controller
+
+Argo CD cannot sync the chart without the CRDs — it fails with
+`no matches for kind "Rollout"`.
+
+```sh
+kubectl create namespace argo-rollouts
+kubectl apply -n argo-rollouts \
+  -f https://github.com/argoproj/argo-rollouts/releases/latest/download/install.yaml
+```
+
+The kubectl plugin is what you drive rollouts with — `kubectl rollout` does not
+work on a Rollout:
+
+```sh
+kubectl krew install argo-rollouts        # or brew install argoproj/tap/kubectl-argo-rollouts
+kubectl argo rollouts get rollout notes-app --watch
+kubectl argo rollouts promote notes-app
+kubectl argo rollouts abort notes-app
+```
+
+For the Argo CD UI to render rollout progress, install the rollout extension
+into Argo CD separately (`argo-rollouts` extension in `argocd-cm`).
+
+### Steps
+
+Configured in `helm/notes-app/values.yaml`:
+
+```yaml
+rollout:
+  canary:
+    steps:
+      - setWeight: 25
+      - pause: {duration: 60s}
+      - setWeight: 50
+      - pause: {duration: 60s}
+      - setWeight: 75
+      - pause: {duration: 60s}
+```
+
+There is no trailing `setWeight: 100` — full promotion is implicit once the
+last step finishes. Use `- pause: {}` with no duration to hold indefinitely
+until someone runs `promote`, which turns the canary into a manual gate.
+
+### The replica-count trap
+
+With `rollout.trafficRouting.enabled: false` (the default), **`setWeight` is
+approximated by replica count**. At `replicaCount: 1` there is no such thing as
+25% — the canary is one whole pod, which is 100% of your traffic. The steps
+above are meaningless until you either raise `replicaCount` to at least 4, or
+turn on traffic routing.
+
+With `trafficRouting.enabled: true`, nginx splits real request percentages
+regardless of replica count. That path needs `ingress.enabled: true`, because
+Rollouts steers traffic by rewriting the stable Ingress, and it renders a second
+`-canary` Service for nginx to split against.
+
+### Why `ignoreDifferences` is in application.yaml
+
+During a canary the Rollouts controller **rewrites the Service selectors** to
+steer traffic. Argo CD sees that as drift and, with `selfHeal: true`, reverts it
+mid-rollout — traffic snaps back to stable and the canary stalls. So:
+
+```yaml
+ignoreDifferences:
+  - group: ""
+    kind: Service
+    jsonPointers: [/spec/selector]
+syncOptions:
+  - RespectIgnoreDifferences=true
+```
+
+Both halves are required. `ignoreDifferences` alone only hides the drift from
+the diff view; a sync would still apply the desired selector and clobber it.
+`RespectIgnoreDifferences=true` makes sync honour the ignore list too.
+
+A paused canary reports the Application as **Progressing**, not Degraded — Argo
+CD ships a health check for Rollouts, so that is expected, not a stuck sync.
 
 ## Image signing
 

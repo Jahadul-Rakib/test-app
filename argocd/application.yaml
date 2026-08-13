@@ -52,12 +52,30 @@ spec:
     # local API server, so nothing outside the network needs API access.
     server: https://kubernetes.default.svc
     namespace: default
+  # The Argo Rollouts controller rewrites Service selectors during a canary to
+  # steer traffic between the stable and canary ReplicaSets. Argo CD sees that
+  # as drift and, with selfHeal below, would revert it mid-rollout -- sending
+  # all traffic back to stable and stalling the canary. Ignoring the selector
+  # hands that field to the Rollouts controller, which is what owns it.
+  #
+  # Only load-bearing when rollout.trafficRouting.enabled is true, but harmless
+  # otherwise, so it stays on to avoid a subtle failure when you flip it.
+  ignoreDifferences:
+    - group: ""
+      kind: Service
+      jsonPointers:
+        - /spec/selector
   syncPolicy:
     automated:
       prune: true
       selfHeal: true
     syncOptions:
       - CreateNamespace=true
+      # ignoreDifferences alone only hides the drift from the diff view -- a
+      # sync would still apply the desired selector and clobber it. This makes
+      # sync honour the ignore list too, which is the half that actually stops
+      # selfHeal from breaking the canary.
+      - RespectIgnoreDifferences=true
     # NOTE: this retry block governs retries of a FAILED sync, not how often
     # git is polled. See the poll interval note in the header above.
     retry:
