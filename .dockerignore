@@ -1,7 +1,14 @@
 .git
+kubernetes/cosign.key
+kubernetes/cosign.password
 __pycache__/
 *.pyc
 helm/
 Jenkinsfile
 README.md
 .venv/
+argocd/
+kubernetes/
+docs/
+*.xml
+*.json

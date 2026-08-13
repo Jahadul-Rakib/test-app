@@ -1,3 +1,36 @@
+# Tells Argo CD to keep the `default` namespace matching helm/notes-app on main.
+#
+# ---------------------------------------------------------------------------
+# Applying it
+# ---------------------------------------------------------------------------
+# Two credentials must exist before this works. Neither is stored here or in
+# the chart, so no token is ever committed:
+#
+#   ./argocd/repo-secret.sh              # Argo CD clones with this -- required
+#   ./kubernetes/dockerhub-pull-secret.sh  # kubelet pulls with this -- only if
+#                                          # the image repo is private
+#   kubectl apply -f argocd/application.yaml
+#
+# The repo credential cannot come from the chart: Argo CD needs it to clone the
+# repo that holds the chart, which would be circular. See docs/credentials.md.
+#
+# ---------------------------------------------------------------------------
+# One-time cluster setup that CANNOT live in this file
+# ---------------------------------------------------------------------------
+# How often Argo CD polls git has no field in the Application CRD -- it is a
+# cluster-wide key in the argocd-cm ConfigMap. Default is 180s; 60s below
+# matches the Jenkins pollSCM interval. A merge patch is required so the other
+# keys the Argo CD install puts in that ConfigMap survive, and the controller
+# only reads the value at startup, so it must be restarted afterwards:
+#
+#   kubectl -n argocd patch configmap argocd-cm --type merge \
+#     -p '{"data":{"timeout.reconciliation":"60s","timeout.reconciliation.jitter":"10s"}}'
+#   kubectl -n argocd rollout restart statefulset/argocd-application-controller
+#   kubectl -n argocd get cm argocd-cm -o jsonpath='{.data.timeout\.reconciliation}'
+#
+# The usual alternative -- a GitHub webhook to /api/webhook for instant syncs --
+# needs an inbound route to this cluster, which the private network rules out.
+# ---------------------------------------------------------------------------
 apiVersion: argoproj.io/v1alpha1
 kind: Application
 metadata:
@@ -25,6 +58,8 @@ spec:
       selfHeal: true
     syncOptions:
       - CreateNamespace=true
+    # NOTE: this retry block governs retries of a FAILED sync, not how often
+    # git is polled. See the poll interval note in the header above.
     retry:
       limit: 5
       backoff:

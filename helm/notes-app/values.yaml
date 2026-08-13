@@ -1,9 +1,15 @@
 replicaCount: 1
 
-# image.repository / image.tag are rewritten by the Jenkins "Update GitOps
-# manifest" stage. Do not hand-edit; Argo CD syncs whatever lands here.
+# Rewritten by the Jenkins 'Update GitOps' stage on every build. Do not
+# hand-edit; Argo CD syncs whatever lands here.
 image: docker.io/jahadulrakib/notes-app:latest
 imagePullPolicy: IfNotPresent
+
+# Reference only -- the chart never creates this Secret. Apply it first with
+# kubernetes/dockerhub-pull-secret.sh, which keeps the token out of git.
+# Must already exist in the release namespace. See docs/credentials.md.
+imagePullSecrets:
+  - name: dockerhub-pull
 
 service:
   type: ClusterIP
