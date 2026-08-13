@@ -39,24 +39,21 @@ pipeline {
         // CI
         CI_BOT_NAME = 'jenkins-ci'
         CI_BOT_EMAIL = 'jenkins-ci@users.noreply.github.com'
-        // Stamped onto the write-back commit, and matched by the `changelog`
-        // when-condition on every stage below. Without that guard the
-        // write-back commit re-triggers this job forever.
+        // Stamped on the write-back commit and matched by the `changelog`
+        // when-condition below -- without it the write-back retriggers forever.
         CI_SKIP_TOKEN = '[ci skip]'
         CI_SKIP_PATTERN = '(?s).*\\[ci skip\\].*'
 
         // Security
         TRIVY_SEVERITY = 'HIGH,CRITICAL'
         TRIVY_EXIT_CODE = '1'
+        // Outside the workspace -- CleanBeforeCheckout would wipe it every build.
         TRIVY_CACHE_DIR = '/var/tmp/jenkins-trivy-cache'
 
         // Optional Cosign signing -- both must be set for the stage to run.
         COSIGN_CREDENTIALS_ID = ''
         COSIGN_PASSWORD_CREDENTIALS_ID = ''
-        // Pinned major version, asserted before signing. v3 removed
-        // --tlog-upload=false and demands a --signing-config with no
-        // transparency log service instead, which cannot work on an agent with
-        // no egress to rekor.sigstore.dev. Verified working on v2.6.5.
+        // v3 removed --tlog-upload=false, which this pipeline depends on.
         COSIGN_MAJOR_VERSION = '2'
 
         // Runtime values, populated during Checkout
@@ -70,8 +67,6 @@ pipeline {
         stage('Checkout') {
             steps {
                 script {
-                    // The checkout step returns the SCM vars, so there is no
-                    // need to shell out to `git rev-parse` for the commit.
                     def scmVars = checkout([
                             $class           : 'GitSCM',
                             branches         : [[name: "*/${env.GIT_BRANCH}"]],
@@ -90,7 +85,6 @@ pipeline {
                     env.GIT_SHA = scmVars.GIT_COMMIT
                     env.IMAGE_TAG = scmVars.GIT_COMMIT
 
-                    // RFC 3339, for the OCI created label.
                     env.BUILD_TIMESTAMP = sh(
                             script: 'date -u +%Y-%m-%dT%H:%M:%SZ',
                             returnStdout: true
@@ -112,8 +106,6 @@ pipeline {
                 timeout(time: 15, unit: 'MINUTES')
             }
             steps {
-                // OCI labels trace a running container back to the exact commit
-                // that produced it.
                 sh '''
                     set -e
 
@@ -145,12 +137,9 @@ pipeline {
 
                     mkdir -p "$TRIVY_CACHE_DIR"
 
-                    # Download only when the cache is missing. Once seeded, every
-                    # later build reuses it and touches the network not at all,
-                    # which is what keeps this working on an agent with no egress.
-                    # A missing DB means nothing can be verified, so that case
-                    # fails the stage rather than passing an unscanned image on
-                    # to the registry.
+                    # Download only when the cache is missing, so later builds need
+                    # no network. No DB at all means nothing can be verified --
+                    # fail rather than pass an unscanned image through.
                     if [ -f "$TRIVY_CACHE_DIR/db/trivy.db" ]; then
                         echo "Using cached vulnerability DB at $TRIVY_CACHE_DIR."
                         SKIP_UPDATE="--skip-db-update --skip-java-db-update"
@@ -177,8 +166,7 @@ pipeline {
                         --output trivy-image-report.txt \
                         "$IMAGE_REPOSITORY:$IMAGE_TAG"
 
-                    # SBOM of what actually shipped: lets this image be
-                    # re-checked against future CVEs without a rebuild.
+                    # SBOM: lets this image be re-checked against future CVEs.
                     trivy image $TRIVY_COMMON \
                         --format cyclonedx \
                         --output sbom-cyclonedx.json \
@@ -206,9 +194,8 @@ pipeline {
 
                     helm lint "$HELM_CHART_DIR"
 
-                    # values.yaml carries a single flat `image:` string, so
-                    # override that same key. image.repository / image.tag would
-                    # coerce it into a map and render image: "map[...]".
+                    # values.yaml carries a flat `image:` string --
+                    # image.repository/tag would render image: "map[...]".
                     helm template "$HELM_RELEASE" "$HELM_CHART_DIR" \
                         --set image="$IMAGE_REPOSITORY:$IMAGE_TAG" \
                         > /dev/null
@@ -275,8 +262,7 @@ pipeline {
                     sh '''
                         set -e
 
-                        # Fail fast on the wrong major version rather than
-                        # halfway through signing with a confusing flag error.
+                        # Fail fast rather than on a confusing flag error.
                         FOUND=$(cosign version 2>/dev/null | awk '/^GitVersion:/ {print $2}')
                         FOUND_MAJOR=$(printf '%s' "$FOUND" | tr -d 'v' | cut -d. -f1)
 
@@ -290,12 +276,9 @@ pipeline {
 
                         echo "$REGISTRY_PASSWORD" | docker login "$REGISTRY" --username "$REGISTRY_USER" --password-stdin
 
-                        # --tlog-upload=false: cosign otherwise publishes the
-                        # signature to the public Rekor transparency log at
-                        # rekor.sigstore.dev, which an agent with no egress
-                        # cannot reach -- the stage would hang, then fail. The
-                        # Kyverno policy sets ctlog.ignoreTlog to match; if the
-                        # two disagree every verification fails.
+                        # --tlog-upload=false: rekor.sigstore.dev is unreachable
+                        # with no egress. The Kyverno policy sets
+                        # ctlog.ignoreTlog to match -- both or neither.
                         cosign sign --yes --tlog-upload=false \
                             --key "$COSIGN_KEY" "$IMAGE_REPOSITORY:$IMAGE_TAG"
 
@@ -330,10 +313,8 @@ pipeline {
                         git config user.name "$CI_BOT_NAME"
                         git config user.email "$CI_BOT_EMAIL"
 
-                        # Rebuilt from the current remote tip on every attempt.
-                        # A single push races any commit landing between fetch
-                        # and push; retrying against a fresh base is what makes
-                        # this safe to run alongside human pushes.
+                        # Rebuilt from the remote tip each attempt -- a single
+                        # push races any commit landing between fetch and push.
                         update_gitops() {
                             git fetch origin "$GIT_BRANCH"
                             git checkout -B "$GIT_BRANCH" "origin/$GIT_BRANCH"

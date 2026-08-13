@@ -1,6 +1,6 @@
 .git
-docs/kubernetes/cosign.key
-docs/kubernetes/cosign.password
+abc_local_setup/cosign/cosign.key
+abc_local_setup/cosign/cosign.password
 __pycache__/
 *.pyc
 helm/
@@ -8,7 +8,7 @@ Jenkinsfile
 README.md
 .venv/
 argocd/
-docs/kubernetes/
-docs/
+abc_local_setup/cosign/
+abc_local_setup/
 *.xml
 *.json

@@ -1,39 +1,28 @@
-# At least 4 so the canary setWeight steps are meaningful. Without a traffic
-# router, weight is approximated by replica count -- at 1 replica the canary is
-# one whole pod, i.e. 100% of traffic.
+# Without a traffic router, canary weight is approximated by replica count.
+# At 4, the steps below land on 1, 2 and 3 pods; at 1 the canary is everything.
 replicaCount: 4
 
-# Rewritten by the Jenkins 'Update GitOps' stage on every build. Do not
-# hand-edit; Argo CD syncs whatever lands here.
+# Rewritten by the Jenkins 'Update GitOps' stage. Do not hand-edit.
 image: docker.io/jahadulrakib/notes-app:latest
 imagePullPolicy: IfNotPresent
 
-# Reference only -- the chart never creates this Secret. Apply it first with
-# kubernetes/dockerhub-pull-secret.sh, which keeps the token out of git.
-# Must already exist in the release namespace. See docs/credentials.md.
+# Referenced only -- created by hand, see abc_local_setup/local-kind-setup.md step 9.2.
 imagePullSecrets:
   - name: dockerhub-pull
 
-# Canary deployment via Argo Rollouts. The workload is a Rollout, not a
-# Deployment -- the Argo Rollouts controller and CRDs must be installed or Argo
-# CD fails to sync with `no matches for kind "Rollout"`.
 rollout:
   revisionHistoryLimit: 3
   maxSurge: 1
   maxUnavailable: 0
 
-  # nginx-based traffic splitting. Off by default because it requires
-  # ingress.enabled -- Rollouts steers traffic by rewriting the stable Ingress,
-  # and has nothing to work with otherwise.
-  #
-  # OFF: setWeight is approximated by replica count, so it rounds to whole
-  #      pods. At replicaCount 4 the steps below land on 1, 2 and 3 pods.
-  #      Drop replicaCount and the steps stop meaning anything.
-  # ON:  setWeight is a real percentage of requests, independent of replicas.
+  # Real percentage-based splitting instead of replica-count approximation.
+  # Requires ingress.enabled -- Rollouts steers by rewriting the stable Ingress.
   trafficRouting:
     enabled: false
 
   canary:
+    # No trailing setWeight: 100 -- full promotion is implicit.
+    # `- pause: {}` with no duration holds until promoted by hand.
     steps:
       - setWeight: 25
       - pause: {duration: 60s}
@@ -41,11 +30,6 @@ rollout:
       - pause: {duration: 60s}
       - setWeight: 75
       - pause: {duration: 60s}
-    # No trailing setWeight: 100 -- the final promotion to full traffic is
-    # implicit once the last step completes.
-    #
-    # Use `- pause: {}` with no duration to hold indefinitely until someone
-    # runs `kubectl argo rollouts promote notes-app`, for a manual gate.
 
 service:
   type: ClusterIP

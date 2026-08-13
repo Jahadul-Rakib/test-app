@@ -1,13 +1,6 @@
 {{- /*
-Rollout replaces the Deployment. Same pod spec -- the difference is that the
-Argo Rollouts controller owns the ReplicaSets and steps through the canary
-instead of doing an all-at-once rolling update.
-
-Requires the Argo Rollouts controller and its CRDs in the cluster. Without them
-Argo CD fails to sync with `no matches for kind "Rollout"`.
-
-Argo CD understands Rollout health natively (it ships a health check for
-argoproj.io resources), so a paused canary shows as Progressing, not Degraded.
+Rollout, not Deployment: the Argo Rollouts controller and CRDs must be
+installed or Argo CD fails with `no matches for kind "Rollout"`.
 */ -}}
 apiVersion: argoproj.io/v1alpha1
 kind: Rollout
@@ -24,9 +17,8 @@ spec:
   strategy:
     canary:
       {{- if .Values.rollout.trafficRouting.enabled }}
-      # With a traffic router, setWeight is a real percentage of requests.
-      # Rollouts mutates these two Services' selectors at runtime to steer
-      # traffic -- see ignoreDifferences in argocd/application.yaml.
+      # Rollouts mutates these Services' selectors to steer traffic -- see
+      # ignoreDifferences in argocd/application.yaml.
       stableService: {{ include "notes-app.fullname" . }}
       canaryService: {{ include "notes-app.fullname" . }}-canary
       trafficRouting:
