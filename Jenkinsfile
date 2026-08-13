@@ -60,10 +60,10 @@ pipeline {
         // v3 removed --tlog-upload=false, which this pipeline depends on.
         COSIGN_MAJOR_VERSION = '2'
 
-        // Runtime values, populated during Checkout
-        GIT_SHA = ''
-        IMAGE_TAG = ''
-        BUILD_TIMESTAMP = ''
+        // GIT_SHA, IMAGE_TAG and BUILD_TIMESTAMP are deliberately NOT declared
+        // here. A pipeline-level environment{} entry is re-applied at the start
+        // of every stage, so declaring them would overwrite whatever Checkout
+        // assigned with the empty default from this block.
     }
 
     stages {
@@ -71,7 +71,7 @@ pipeline {
         stage('Checkout') {
             steps {
                 script {
-                    def scmVars = checkout([
+                    checkout([
                             $class           : 'GitSCM',
                             branches         : [[name: "*/${env.GIT_BRANCH}"]],
                             extensions       : [
@@ -86,8 +86,15 @@ pipeline {
                             ]
                     ])
 
-                    env.GIT_SHA = scmVars.GIT_COMMIT
-                    env.IMAGE_TAG = scmVars.GIT_COMMIT
+                    // Read the SHA from the workspace, not from checkout()'s
+                    // return value -- that map comes back without GIT_COMMIT on
+                    // current plugin versions and every image label silently
+                    // renders empty.
+                    env.GIT_SHA = sh(
+                            script: 'git rev-parse HEAD',
+                            returnStdout: true
+                    ).trim()
+                    env.IMAGE_TAG = env.GIT_SHA
 
                     env.BUILD_TIMESTAMP = sh(
                             script: 'date -u +%Y-%m-%dT%H:%M:%SZ',

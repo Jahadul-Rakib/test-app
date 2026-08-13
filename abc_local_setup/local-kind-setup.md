@@ -357,6 +357,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         docker-cli git curl ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
+# docker buildx -- the Build stage sets DOCKER_BUILDKIT=1, and without this
+# plugin the build dies with "BuildKit is enabled but the buildx component is
+# missing or broken". The docker-cli package does not carry it.
+ARG BUILDX_VERSION=v0.36.1
+RUN mkdir -p /usr/libexec/docker/cli-plugins \
+    && curl -fsSL -o /usr/libexec/docker/cli-plugins/docker-buildx \
+       "https://github.com/docker/buildx/releases/download/${BUILDX_VERSION}/buildx-${BUILDX_VERSION}.linux-$(dpkg --print-architecture)" \
+    && chmod +x /usr/libexec/docker/cli-plugins/docker-buildx
+
 # helm -- the pipeline lints and renders the chart
 RUN curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
 
