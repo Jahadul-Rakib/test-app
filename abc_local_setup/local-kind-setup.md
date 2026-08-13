@@ -691,8 +691,7 @@ cosign verify --key /tmp/cosign.pub --insecure-ignore-tlog \
 
 ### 9.4 Jenkins credentials
 
-At <http://jenkins.localtest.me> → **Manage Jenkins → Credentials → System →
-Global**. The IDs must match exactly — the `Jenkinsfile` looks them up by ID:
+The IDs must match exactly — the `Jenkinsfile` looks them up by ID:
 
 | ID | Kind | Username | Password / content |
 |---|---|---|---|
@@ -703,6 +702,95 @@ Global**. The IDs must match exactly — the `Jenkinsfile` looks them up by ID:
 
 `github-token` needs **write** `repo` scope — the `Update GitOps` stage commits
 the image tag back.
+
+Create the two username/password ones from the shell. Every Jenkins POST needs
+a CSRF crumb, and the crumb is bound to the session cookie, so `-c`/`-b` on the
+same cookie jar is not optional:
+
+```sh
+export JU=admin
+export JP=$(kubectl -n jenkins get secret jenkins \
+  -o jsonpath='{.data.jenkins-admin-password}' | base64 -d)
+export J=http://jenkins.localtest.me
+
+CRUMB=$(curl -s -u "$JU:$JP" -c /tmp/jcookie "$J/crumbIssuer/api/json" \
+  | sed -n 's/.*"crumb":"\([^"]*\)".*/\1/p')
+
+add_cred() {   # id username secret
+  curl -s -o /dev/null -w "  $1: HTTP %{http_code}\n" \
+    -u "$JU:$JP" -b /tmp/jcookie -H "Jenkins-Crumb: $CRUMB" \
+    --data-urlencode "json={\"\":\"0\",\"credentials\":{\"scope\":\"GLOBAL\",\"id\":\"$1\",\"username\":\"$2\",\"password\":\"$3\",\"\$class\":\"com.cloudbees.plugins.credentials.impl.UsernamePasswordCredentialsImpl\"}}" \
+    "$J/credentials/store/system/domain/_/createCredentials"
+}
+
+add_cred github-token Jahadul-Rakib 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
+add_cred dockerhub    jahadulrakib  dckr_pat_getuazgIuPPCJFgRfkJQ5_mjRQQ
+```
+
+`HTTP 302` is success — Jenkins redirects after creating. Confirm exactly two
+exist, with the IDs spelled right:
+
+```sh
+curl -s -u "$JU:$JP" \
+  "$J/credentials/store/system/domain/_/api/json?tree=credentials\[id\]"
+```
+
+The cosign pair is optional and easiest in the UI, since one is a file upload:
+**Manage Jenkins → Credentials → System → Global**.
+
+### 9.5 The pipeline job
+
+```sh
+cat <<'EOF' >/tmp/job.xml
+<?xml version='1.1' encoding='UTF-8'?>
+<flow-definition plugin="workflow-job">
+  <description>notes-app CI/CD</description>
+  <keepDependencies>false</keepDependencies>
+  <definition class="org.jenkinsci.plugins.workflow.cps.CpsScmFlowDefinition" plugin="workflow-cps">
+    <scm class="hudson.plugins.git.GitSCM" plugin="git">
+      <configVersion>2</configVersion>
+      <userRemoteConfigs>
+        <hudson.plugins.git.UserRemoteConfig>
+          <url>https://github.com/Jahadul-Rakib/test-app.git</url>
+          <credentialsId>github-token</credentialsId>
+        </hudson.plugins.git.UserRemoteConfig>
+      </userRemoteConfigs>
+      <branches>
+        <hudson.plugins.git.BranchSpec><name>*/main</name></hudson.plugins.git.BranchSpec>
+      </branches>
+      <extensions/>
+    </scm>
+    <scriptPath>Jenkinsfile</scriptPath>
+    <lightweight>false</lightweight>
+  </definition>
+  <disabled>false</disabled>
+</flow-definition>
+EOF
+
+curl -s -o /dev/null -w '  create: HTTP %{http_code}\n' \
+  -u "$JU:$JP" -b /tmp/jcookie -H "Jenkins-Crumb: $CRUMB" \
+  -H 'Content-Type: application/xml' --data-binary @/tmp/job.xml \
+  "$J/createItem?name=notes-app"
+
+curl -s -o /dev/null -w '  build:  HTTP %{http_code}\n' \
+  -u "$JU:$JP" -b /tmp/jcookie -H "Jenkins-Crumb: $CRUMB" \
+  -X POST "$J/job/notes-app/build"
+```
+
+`200` then `201`. Watch it:
+
+```sh
+curl -s -u "$JU:$JP" "$J/job/notes-app/lastBuild/api/json?tree=number,building,result"
+curl -s -u "$JU:$JP" "$J/job/notes-app/lastBuild/consoleText" | tail -40
+```
+
+Check a Jenkinsfile without running a build — this catches parse errors in
+seconds instead of a failed build:
+
+```sh
+curl -s -u "$JU:$JP" -b /tmp/jcookie -H "Jenkins-Crumb: $CRUMB" \
+  -F "jenkinsfile=<Jenkinsfile" "$J/pipeline-model-converter/validate"
+```
 
 The two cosign entries are optional. The `Sign Image` stage is gated on both
 `COSIGN_CREDENTIALS_ID` and `COSIGN_PASSWORD_CREDENTIALS_ID` being non-empty in
