@@ -10,9 +10,6 @@ pipeline {
     }
 
     triggers {
-        // Webhooks cannot reach a Jenkins server with no inbound route, so poll.
-        // Matches Argo CD's 60s reconciliation, keeping both halves of the
-        // push-to-pod delay at the same granularity.
         pollSCM('* * * * *')
     }
 
@@ -39,19 +36,11 @@ pipeline {
         // CI
         CI_BOT_NAME = 'jenkins-ci'
         CI_BOT_EMAIL = 'jenkins-ci@users.noreply.github.com'
-        // Stamped on the write-back commit; every stage below matches it with
-        // a `changelog` when-condition, or the write-back retriggers forever.
-        //
-        // The regex is written out literally at each use, not held here: the
-        // `changelog` condition is compiled at PARSE time, before env vars
-        // exist, so "${CI_SKIP_PATTERN}" is validated as a regex itself and
-        // fails with "Illegal repetition".
         CI_SKIP_TOKEN = '[ci skip]'
 
         // Security
         TRIVY_SEVERITY = 'HIGH,CRITICAL'
         TRIVY_EXIT_CODE = '1'
-        // Outside the workspace -- CleanBeforeCheckout would wipe it every build.
         TRIVY_CACHE_DIR = '/var/tmp/jenkins-trivy-cache'
 
         // Optional Cosign signing -- both must be set for the stage to run.
@@ -59,11 +48,6 @@ pipeline {
         COSIGN_PASSWORD_CREDENTIALS_ID = ''
         // v3 removed --tlog-upload=false, which this pipeline depends on.
         COSIGN_MAJOR_VERSION = '2'
-
-        // GIT_SHA, IMAGE_TAG and BUILD_TIMESTAMP are deliberately NOT declared
-        // here. A pipeline-level environment{} entry is re-applied at the start
-        // of every stage, so declaring them would overwrite whatever Checkout
-        // assigned with the empty default from this block.
     }
 
     stages {
