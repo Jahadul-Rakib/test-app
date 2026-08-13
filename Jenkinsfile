@@ -326,42 +326,38 @@ pipeline {
 
                         # Rebuilt from the remote tip each attempt -- a single
                         # push races any commit landing between fetch and push.
+                        #
+                        # Every git call uses the credentialed URL. `origin` has
+                        # no credentials attached, so `git fetch origin` fails
+                        # with "could not read Username" and, because set -e is
+                        # disabled inside a function used as an if-condition,
+                        # the failure used to sail through as success.
+                        REMOTE="https://${GIT_USER}:${GIT_TOKEN}@${GIT_REPOSITORY}"
+
                         update_gitops() {
-                            git fetch origin "$GIT_BRANCH"
-                            git checkout -B "$GIT_BRANCH" "origin/$GIT_BRANCH"
+                            git fetch "$REMOTE" "$GIT_BRANCH" || return 1
+                            git checkout -B "$GIT_BRANCH" FETCH_HEAD || return 1
 
-                            python3 - "$HELM_VALUES_FILE" "$IMAGE_REPOSITORY:$IMAGE_TAG" <<'PY'
-import sys
-from pathlib import Path
+                            # sed, not python3 -- the agent image has no python.
+                            sed -i "s|^image:.*|image: $IMAGE_REPOSITORY:$IMAGE_TAG|" \
+                                "$HELM_VALUES_FILE" || return 1
 
-values_file = Path(sys.argv[1])
-image = sys.argv[2]
+                            # Prove the rewrite landed. Without this a failed
+                            # edit looks identical to "nothing to do".
+                            if ! grep -q "^image: $IMAGE_REPOSITORY:$IMAGE_TAG$" "$HELM_VALUES_FILE"; then
+                                echo "ERROR: could not rewrite image line in $HELM_VALUES_FILE" >&2
+                                return 1
+                            fi
 
-lines = values_file.read_text().splitlines(keepends=True)
-updated = False
-
-for i, line in enumerate(lines):
-    if line.startswith("image:"):
-        newline = "\\n" if line.endswith("\\n") else ""
-        lines[i] = f"image: {image}{newline}"
-        updated = True
-        break
-
-if not updated:
-    raise SystemExit("ERROR: image field not found in values.yaml")
-
-values_file.write_text("".join(lines))
-PY
-
-                            git add "$HELM_VALUES_FILE"
+                            git add "$HELM_VALUES_FILE" || return 1
 
                             if git diff --cached --quiet; then
-                                echo "GitOps manifest is already up to date."
+                                echo "GitOps manifest already at $IMAGE_TAG."
                                 return 0
                             fi
 
-                            git commit -m "chore(deploy): $APP_NAME -> $IMAGE_TAG $CI_SKIP_TOKEN"
-                            git push "https://${GIT_USER}:${GIT_TOKEN}@${GIT_REPOSITORY}" "HEAD:$GIT_BRANCH"
+                            git commit -m "chore(deploy): $APP_NAME -> $IMAGE_TAG $CI_SKIP_TOKEN" || return 1
+                            git push "$REMOTE" "HEAD:$GIT_BRANCH" || return 1
                         }
 
                         for attempt in 1 2 3; do

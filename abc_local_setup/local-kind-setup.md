@@ -439,6 +439,14 @@ controller:
     - pipeline-utility-steps:latest
     - timestamper:latest
 
+# No dynamic Kubernetes agents. The chart ships a default pod template, and
+# `agent any` in the Jenkinsfile will happily schedule onto it -- a bare
+# inbound-agent image with no docker, helm, trivy or cosign, so the build dies
+# with `docker: not found`. Turning this off leaves the controller as the only
+# executor, which is where the tooling lives.
+agent:
+  enabled: false
+
 persistence:
   storageClass: standard
   size: 8Gi
