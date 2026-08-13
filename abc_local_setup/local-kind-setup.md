@@ -21,9 +21,13 @@ need its own ingress.
 `*.localtest.me` resolves to `127.0.0.1` publicly, so there is nothing to add to
 `/etc/hosts`.
 
-Budget ~30 minutes, most of it image pulls. Give Docker at least **8 GB** — three
-kind nodes plus Argo CD, Jenkins, Kyverno and ingress-nginx will not fit in the
-2 GB default.
+Budget ~30 minutes, most of it image pulls.
+
+Give Docker **4 GB minimum, 6 GB comfortable**. Everything below fits in 4 GB as
+written; Kyverno in step 6 is the piece that pushes it over, so it is opt-in.
+At 4 GB do not add nodes or re-enable the Argo CD components switched off in
+step 5 — the first thing to fail is the API server, with `TLS handshake
+timeout`.
 
 ---
 
@@ -88,12 +92,17 @@ nodes:
       # docker daemon. Passing the host socket through lets the Jenkins pod
       # drive your host's Docker. Anything in that pod effectively has root on
       # your machine -- acceptable locally, never in a shared cluster.
+      #
+      # On EVERY node, not just this one: the scheduler can put Jenkins on any
+      # of them, and a node without the mount silently gets an empty directory
+      # at that path instead, so `docker ps` fails with "permission denied".
       - hostPath: /var/run/docker.sock
         containerPath: /var/run/docker.sock
   - role: worker
     image: kindest/node:v1.33.1
-  - role: worker
-    image: kindest/node:v1.33.1
+    extraMounts:
+      - hostPath: /var/run/docker.sock
+        containerPath: /var/run/docker.sock
 EOF
 
 kind create cluster --config /tmp/kind-notes-app.yaml
@@ -101,9 +110,9 @@ kubectl cluster-info --context kind-notes-app
 kubectl get nodes
 ```
 
-Three nodes: the control-plane carries ingress and publishes 80/443 to your
-host; two workers so the app's 4 replicas actually spread and the canary steps
-mean something.
+Two nodes: the control-plane carries ingress and publishes 80/443 to your host,
+plus one worker. Each kind node costs roughly 400 MB, so a third is the easiest
+thing to cut at 4 GB — the app's 4 replicas still spread across two.
 
 > **Port 80 in use?** Cluster creation fails. Stop whatever holds it, or change
 > both `hostPort: 80` and the URLs below to `8080`.
@@ -130,7 +139,7 @@ helm install ingress-nginx ingress-nginx/ingress-nginx \
   --version 4.15.1 \
   --set controller.hostPort.enabled=true \
   --set controller.service.type=NodePort \
-  --set 'controller.nodeSelector.ingress-ready=true' \
+  --set-string 'controller.nodeSelector.ingress-ready=true' \
   --set 'controller.tolerations[0].key=node-role.kubernetes.io/control-plane' \
   --set 'controller.tolerations[0].operator=Equal' \
   --set 'controller.tolerations[0].effect=NoSchedule' \
@@ -139,8 +148,12 @@ helm install ingress-nginx ingress-nginx/ingress-nginx \
   --wait
 ```
 
-The single quotes are not optional on zsh (the macOS default) — unquoted
-`tolerations[0]` is read as a glob and the command dies with `no matches found`.
+Two flag details that are not cosmetic. The single quotes are required on zsh
+(the macOS default) — unquoted `tolerations[0]` is read as a glob and the
+command dies with `no matches found`. And `nodeSelector` must use
+`--set-string`: with plain `--set`, helm types `true` as a boolean and the API
+server rejects the Deployment with `cannot unmarshal bool into ... nodeSelector
+of type string`.
 
 Those flags matter. The stock chart asks for a `LoadBalancer` Service, which
 never gets an external IP on kind and leaves the controller `<pending>` forever.
@@ -165,6 +178,7 @@ helm install argo-rollouts argo/argo-rollouts \
   --namespace argo-rollouts --create-namespace \
   --version 2.41.1 \
   --set dashboard.enabled=true \
+  --set controller.replicas=1 \
   --wait
 
 kubectl get crd rollouts.argoproj.io
@@ -225,8 +239,14 @@ controller:
   replicas: 1
 repoServer:
   replicas: 1
-applicationSet:
-  replicas: 1
+
+# Not used by this setup, ~100-150 MB each. Turning them off is part of what
+# keeps Argo CD inside a 4 GB budget. (applicationSet has no top-level
+# `enabled` key in this chart, so it stays -- it is small.)
+dex:
+  enabled: false
+notifications:
+  enabled: false
 EOF
 
 helm install argocd argo/argo-cd \
@@ -236,22 +256,19 @@ helm install argocd argo/argo-cd \
   --wait
 ```
 
-Get the admin password:
-
-```sh
-kubectl -n argocd get secret argocd-initial-admin-secret \
-  -o jsonpath='{.data.password}' | base64 -d; echo
-```
-
-Log in at <http://argocd.localtest.me> as `admin` once step 8 publishes the
-ingress. Change the password there, then delete
-`argocd-initial-admin-secret`.
+Credentials are in step 8.1, once the ingress exists.
 
 ---
 
 ## 6. Kyverno (optional — signature enforcement)
 
 Skip if you are not signing yet; nothing else depends on it.
+
+> **At 4 GB, skip this.** Kyverno's four controllers are roughly 500 MB, which
+> is the difference between the stack holding and the API server dropping out.
+> Worse, its webhook fails closed: if the admission pod is OOM-killed, every
+> write to the cluster starts failing with `failed calling webhook`. Come back
+> to this once Docker has 6 GB.
 
 ```sh
 helm install kyverno kyverno/kyverno \
@@ -274,10 +291,6 @@ kind: ClusterPolicy
 metadata:
   name: verify-notes-app
 spec:
-  # Audit = log failures only. Confirm it passes, THEN switch to Enforce --
-  # under Enforce an unsigned image means pods are refused outright and the app
-  # stops deploying.
-  validationFailureAction: Audit
   background: false
   rules:
     - name: check-cosign-signature
@@ -289,14 +302,16 @@ spec:
               namespaces:
                 - default
       verifyImages:
-        - imageReferences:
+        # Audit = log failures only. Confirm it passes, THEN switch to Enforce
+        # -- under Enforce an unsigned image means pods are refused outright
+        # and the app stops deploying. (spec.validationFailureAction is
+        # deprecated; this per-rule field replaces it.)
+        - failureAction: Audit
+          # Kyverno defaults this to true, which Audit rejects -- it will not
+          # rewrite tags to digests on a rule that is not enforcing.
+          mutateDigest: false
+          imageReferences:
             - "docker.io/jahadulrakib/notes-app:*"
-          # Must match how Jenkins signs. The pipeline passes
-          # --tlog-upload=false because rekor.sigstore.dev is unreachable from a
-          # private network, so there is no transparency-log entry to check.
-          # Omit this and every verification fails.
-          ctlog:
-            ignoreTlog: true
           attestors:
             - count: 1
               entries:
@@ -306,6 +321,14 @@ spec:
                       MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE9pzDmp26walej+dJG0KmqP82X8EK
                       MbGDNyWjJNZhmYd2RUeNZeOYVHyYYcqCBkhNAu6TElNyVW+fC/RX8ON0hA==
                       -----END PUBLIC KEY-----
+                    # Must match how Jenkins signs. The pipeline passes
+                    # --tlog-upload=false because rekor.sigstore.dev is
+                    # unreachable with no egress, so there is no transparency
+                    # log entry to check. Omit and every verification fails.
+                    rekor:
+                      ignoreTlog: true
+                    ctlog:
+                      ignoreSCT: true
 EOF
 
 kubectl get clusterpolicy verify-notes-app
@@ -326,8 +349,12 @@ cat <<'EOF' >/tmp/Dockerfile.jenkins
 FROM jenkins/jenkins:lts-jdk21
 USER root
 
+# docker-cli, NOT docker.io -- on Debian the docker.io package ships only the
+# daemon (dockerd, docker-proxy), and the client lives in docker-cli. Install
+# docker.io and `docker` is simply absent. The daemon is not wanted here anyway;
+# this container drives the host's, through the mounted socket.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        docker.io git curl ca-certificates \
+        docker-cli git curl ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 # helm -- the pipeline lints and renders the chart
@@ -372,8 +399,18 @@ controller:
 
   # Root so the container can use the mounted docker socket without fighting
   # group ownership. Local-only shortcut.
+  #
+  # BOTH are required: the chart sets containerSecurityContext.runAsUser to
+  # 1000, which overrides the pod-level runAsUser. Set only the pod-level one
+  # and the container still starts as uid 1000, with "permission denied" on
+  # the socket.
   runAsUser: 0
   fsGroup: 0
+  containerSecurityContext:
+    runAsUser: 0
+    runAsGroup: 0
+    readOnlyRootFilesystem: false
+    allowPrivilegeEscalation: false
 
   jenkinsUrl: http://jenkins.localtest.me
   ingress:
@@ -381,6 +418,9 @@ controller:
     ingressClassName: nginx
     hostName: jenkins.localtest.me
 
+  # The Jenkinsfile fails to parse without these. timestamper backs
+  # options { timestamps() }; leave it out and the pipeline dies with
+  # `Invalid option type "timestamps"` before any stage runs.
   installPlugins:
     - kubernetes:latest
     - workflow-aggregator:latest
@@ -388,7 +428,7 @@ controller:
     - configuration-as-code:latest
     - docker-workflow:latest
     - pipeline-utility-steps:latest
-    - junit:latest
+    - timestamper:latest
 
 persistence:
   storageClass: standard
@@ -410,19 +450,16 @@ helm install jenkins jenkins/jenkins \
   --wait --timeout 10m
 ```
 
-Admin password:
+Credentials are in step 8.1. Confirm the tools actually made it in:
 
 ```sh
-kubectl -n jenkins get secret jenkins \
-  -o jsonpath='{.data.jenkins-admin-password}' | base64 -d; echo
+kubectl -n jenkins exec jenkins-0 -c jenkins -- sh -c \
+  'id; docker version --format "docker server {{.Server.Version}}"; helm version --short; trivy --version | head -1; cosign version | grep GitVersion; git --version'
 ```
 
-Confirm the tools actually made it in:
-
-```sh
-kubectl -n jenkins exec deploy/jenkins -c jenkins -- \
-  sh -c 'docker version --format "{{.Server.Version}}"; helm version --short; trivy --version | head -1; cosign version | grep GitVersion; git --version'
-```
+Expect `uid=0(root)` and a real `docker server` version. If docker reports
+`permission denied`, the container is not root or the node it landed on has no
+socket — see the troubleshooting entries at the end.
 
 Then in the UI: create a **Pipeline** job pointed at this repo with script path
 `Jenkinsfile`. Polling is declared in the file itself, so no trigger config is
@@ -465,6 +502,47 @@ done
 ```
 
 `200` or `302` from each means the UIs are reachable.
+
+### 8.1 Logging in
+
+Both usernames are `admin`; both passwords are generated at install time and
+kept in a Secret. Print them:
+
+```sh
+# Argo CD -- http://argocd.localtest.me
+echo "user: admin"
+kubectl -n argocd get secret argocd-initial-admin-secret \
+  -o jsonpath='{.data.password}' | base64 -d; echo
+
+# Jenkins -- http://jenkins.localtest.me
+kubectl -n jenkins get secret jenkins \
+  -o jsonpath='{.data.jenkins-admin-user}' | base64 -d; echo
+kubectl -n jenkins get secret jenkins \
+  -o jsonpath='{.data.jenkins-admin-password}' | base64 -d; echo
+```
+
+Or both at once:
+
+```sh
+printf 'Argo CD   http://argocd.localtest.me\n  user: admin\n  pass: %s\n' \
+  "$(kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath='{.data.password}' | base64 -d)"
+printf 'Jenkins   http://jenkins.localtest.me\n  user: %s\n  pass: %s\n' \
+  "$(kubectl -n jenkins get secret jenkins -o jsonpath='{.data.jenkins-admin-user}' | base64 -d)" \
+  "$(kubectl -n jenkins get secret jenkins -o jsonpath='{.data.jenkins-admin-password}' | base64 -d)"
+```
+
+The `base64 -d` matters — Secret values are stored base64-encoded, so reading
+the field without it gives you gibberish that will not log you in.
+
+Argo CD's username is always `admin` and is not stored in the Secret; only the
+password is. After logging in, change it under **User Info → Update Password**,
+then delete the bootstrap Secret, which Argo CD does not need again:
+
+```sh
+kubectl -n argocd delete secret argocd-initial-admin-secret
+```
+
+Jenkins keeps its Secret in use, so leave that one alone.
 
 ---
 
@@ -642,16 +720,21 @@ kubectl -n argocd get application notes-app -w
 > they are recreated immediately and `IfNotPresent` finds it locally. The
 > Rollouts UI has a **Restart** button that does the same thing.
 
-Publish the app on the ingress too:
+To publish the app on the ingress, edit `helm/notes-app/values.yaml`:
 
-```sh
-helm template notes-app helm/notes-app \
-  --set ingress.enabled=true --set ingress.host=notes.localtest.me | kubectl apply -f -
+```yaml
+ingress:
+  enabled: true
+  host: notes.localtest.me
 ```
 
-For a durable version, set `ingress.enabled: true` and
-`ingress.host: notes.localtest.me` in `helm/notes-app/values.yaml` and let Argo
-CD sync it.
+Commit and push, or hit **Refresh** in the Argo CD UI to pick up a local change
+once pushed. Argo CD then renders and applies the Ingress itself.
+
+> Do **not** shortcut this with `helm template ... | kubectl apply -f -`. It
+> works for about a minute, then Argo CD sees the live Service and Rollout
+> differing from git, reports `OutOfSync`, and `selfHeal` reverts your Ingress.
+> Anything Argo CD owns has to change through git.
 
 ---
 
@@ -770,4 +853,24 @@ kubectl -n argo-rollouts get svc argo-rollouts-dashboard
 A missing `rollout-extension` initContainer usually means a second top-level
 `server:` key in the values file silently overrode the first.
 
-**Pods `Pending` on memory** — raise Docker's memory limit to 8 GB.
+**Every write fails with `failed calling webhook "validate.kyverno.svc-fail"`**
+— Kyverno's webhook fails closed, so if its admission controller is down (OOM
+killed, scaled to 0, still starting) the whole cluster becomes read-only. Get it
+running again, or drop the webhooks if you are removing Kyverno:
+
+```sh
+kubectl -n kyverno get pods
+kubectl delete validatingwebhookconfiguration,mutatingwebhookconfiguration \
+  -l webhook.kyverno.io/managed-by=kyverno
+```
+
+**Jenkins stuck `Pending` with `didn't match PersistentVolume's node affinity`**
+— the local-path provisioner binds the PVC to whichever node first ran the pod.
+If Jenkins later has to move, delete the PVC and `helm upgrade` to recreate it
+(the chart manages the PVC separately from the StatefulSet, so deleting the pod
+alone will not bring it back).
+
+**API server unreachable, `TLS handshake timeout`, pods restarting** — memory.
+This whole stack needs **8 GB** given to Docker; at 4 GB the Argo CD server and
+repo-server are OOM-killed in a loop and the API server drops out under load.
+Raise the limit, or drop Kyverno and one worker node.

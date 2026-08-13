@@ -39,10 +39,14 @@ pipeline {
         // CI
         CI_BOT_NAME = 'jenkins-ci'
         CI_BOT_EMAIL = 'jenkins-ci@users.noreply.github.com'
-        // Stamped on the write-back commit and matched by the `changelog`
-        // when-condition below -- without it the write-back retriggers forever.
+        // Stamped on the write-back commit; every stage below matches it with
+        // a `changelog` when-condition, or the write-back retriggers forever.
+        //
+        // The regex is written out literally at each use, not held here: the
+        // `changelog` condition is compiled at PARSE time, before env vars
+        // exist, so "${CI_SKIP_PATTERN}" is validated as a regex itself and
+        // fails with "Illegal repetition".
         CI_SKIP_TOKEN = '[ci skip]'
-        CI_SKIP_PATTERN = '(?s).*\\[ci skip\\].*'
 
         // Security
         TRIVY_SEVERITY = 'HIGH,CRITICAL'
@@ -100,7 +104,7 @@ pipeline {
 
         stage('Build Image') {
             when {
-                not { changelog "${CI_SKIP_PATTERN}" }
+                not { changelog '(?s).*\\[ci skip\\].*' }
             }
             options {
                 timeout(time: 15, unit: 'MINUTES')
@@ -126,7 +130,7 @@ pipeline {
         // and therefore can never be referenced by the GitOps write-back.
         stage('Scan Image') {
             when {
-                not { changelog "${CI_SKIP_PATTERN}" }
+                not { changelog '(?s).*\\[ci skip\\].*' }
             }
             options {
                 timeout(time: 15, unit: 'MINUTES')
@@ -186,7 +190,7 @@ pipeline {
 
         stage('Validate Helm Chart') {
             when {
-                not { changelog "${CI_SKIP_PATTERN}" }
+                not { changelog '(?s).*\\[ci skip\\].*' }
             }
             steps {
                 sh '''
@@ -207,7 +211,7 @@ pipeline {
 
         stage('Push Image') {
             when {
-                not { changelog "${CI_SKIP_PATTERN}" }
+                not { changelog '(?s).*\\[ci skip\\].*' }
             }
             options {
                 // Registry pushes are the flakiest step in the pipeline.
@@ -238,7 +242,7 @@ pipeline {
         stage('Sign Image') {
             when {
                 allOf {
-                    not { changelog "${CI_SKIP_PATTERN}" }
+                    not { changelog '(?s).*\\[ci skip\\].*' }
                     expression {
                         env.COSIGN_CREDENTIALS_ID?.trim() && env.COSIGN_PASSWORD_CREDENTIALS_ID?.trim()
                     }
@@ -294,7 +298,7 @@ pipeline {
         // route to the API server.
         stage('Update GitOps') {
             when {
-                not { changelog "${CI_SKIP_PATTERN}" }
+                not { changelog '(?s).*\\[ci skip\\].*' }
             }
             options {
                 timeout(time: 10, unit: 'MINUTES')
