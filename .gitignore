@@ -1,8 +1,8 @@
 # Cosign signing key and its password. Never commit these; anyone holding them
 # can sign images the cluster will trust. kubernetes/cosign.pub is the public
 # half and IS safe to commit -- Kyverno needs it.
-kubernetes/cosign.key
-kubernetes/cosign.password
+docs/kubernetes/cosign.key
+docs/kubernetes/cosign.password
 
 # Python
 __pycache__/

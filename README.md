@@ -70,9 +70,9 @@ forever. The write-back commit is stamped `[ci skip]`, and every stage carries
 | `helm/notes-app/` | The chart Argo CD renders |
 | `argocd/application.yaml` | Tells Argo CD what to watch |
 | `argocd/repo-secret.sh` | Credential Argo CD clones with |
-| `kubernetes/dockerhub-pull-secret.sh` | Credential the kubelet pulls with |
-| `kubernetes/kyverno-verify-image.yaml` | Signature enforcement policy |
-| `kubernetes/cosign.pub` | Public signing key (safe in git) |
+| `docs/kubernetes/dockerhub-pull-secret.sh` | Credential the kubelet pulls with |
+| `docs/kubernetes/kyverno-verify-image.yaml` | Signature enforcement policy |
+| `docs/kubernetes/cosign.pub` | Public signing key (safe in git) |
 | `docs/credentials.md` | Every credential, where it lives and why |
 
 ## Setup
@@ -85,7 +85,7 @@ Manage Jenkins → Credentials → System → Global:
 |---|---|---|
 | `github-token` | Username with password | GitHub user + PAT with **write** `repo` scope |
 | `dockerhub` | Username with password | Docker Hub user + access token |
-| `cosign-key` | Secret file | `kubernetes/cosign.key` (optional, signing) |
+| `cosign-key` | Secret file | `docs/kubernetes/cosign.key` (optional, signing) |
 | `cosign-key-password` | Secret text | the key's password (optional, signing) |
 
 The IDs must match exactly — the `Jenkinsfile` looks them up by ID.
@@ -150,21 +150,21 @@ Two halves that are easy to conflate:
 
 | | Key | Used by |
 |---|---|---|
-| **CI** — signs | `kubernetes/cosign.key` (private) | Jenkins, `Sign Image` stage |
-| **CD** — verifies | `kubernetes/cosign.pub` (public) | Kyverno, at admission |
+| **CI** — signs | `docs/kubernetes/cosign.key` (private) | Jenkins, `Sign Image` stage |
+| **CD** — verifies | `docs/kubernetes/cosign.pub` (public) | Kyverno, at admission |
 
 Signing alone enforces nothing. Until Kyverno is installed with the public key,
 the signature is just provenance metadata.
 
 ### Generating the keypair
 
-A keypair is already generated. All three files sit in `kubernetes/`:
+A keypair is already generated. All three files sit in `docs/kubernetes/`:
 
 | File | In git? | Goes to |
 |---|---|---|
-| `kubernetes/cosign.key` | **no** — gitignored | Jenkins credential `cosign-key` |
-| `kubernetes/cosign.password` | **no** — gitignored | Jenkins credential `cosign-key-password` |
-| `kubernetes/cosign.pub` | **yes** — public | Embedded in the Kyverno policy |
+| `docs/kubernetes/cosign.key` | **no** — gitignored | Jenkins credential `cosign-key` |
+| `docs/kubernetes/cosign.password` | **no** — gitignored | Jenkins credential `cosign-key-password` |
+| `docs/kubernetes/cosign.pub` | **yes** — public | Embedded in the Kyverno policy |
 
 `.gitignore` blocks the two private ones, so `git status` will not list them —
 that is deliberate, not a sign they are missing. Confirm with:
@@ -196,9 +196,9 @@ cosign public-key --key kubernetes/cosign.key   # equals kubernetes/cosign.pub
 
 ### Wiring the private key into Jenkins (CI)
 
-1. Manage Jenkins → Credentials → Add → **Secret file**, upload `kubernetes/cosign.key`,
+1. Manage Jenkins → Credentials → Add → **Secret file**, upload `docs/kubernetes/cosign.key`,
    ID `cosign-key`.
-2. Add → **Secret text**, paste the contents of `kubernetes/cosign.password`,
+2. Add → **Secret text**, paste the contents of `docs/kubernetes/cosign.password`,
    ID `cosign-key-password`.
 3. Fill both IDs into the `Jenkinsfile` `environment` block:
 
@@ -207,8 +207,8 @@ cosign public-key --key kubernetes/cosign.key   # equals kubernetes/cosign.pub
    COSIGN_PASSWORD_CREDENTIALS_ID = 'cosign-key-password'
    ```
 
-4. Move `kubernetes/cosign.password` into your password manager and delete the
-   local file. Keep `kubernetes/cosign.key` somewhere safe — anyone holding it
+4. Move `docs/kubernetes/cosign.password` into your password manager and delete the
+   local file. Keep `docs/kubernetes/cosign.key` somewhere safe — anyone holding it
    can sign images your cluster will trust.
 
 The `Sign Image` stage is gated on **both** IDs being non-empty, so it stays
@@ -216,7 +216,7 @@ skipped until you fill in both.
 
 ### Wiring the public key into Kyverno (CD)
 
-`kubernetes/kyverno-verify-image.yaml` already has the public key embedded:
+`docs/kubernetes/kyverno-verify-image.yaml` already has the public key embedded:
 
 ```sh
 helm repo add kyverno https://kyverno.github.io/kyverno
