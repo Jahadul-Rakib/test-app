@@ -3,7 +3,7 @@
 replicaCount: 4
 
 # Rewritten by the Jenkins 'Update GitOps' stage. Do not hand-edit.
-image: docker.io/jahadulrakib/notes-app:187ca69a784f4833961d46ee74915b847c7051dd
+image: docker.io/jahadulrakib/notes-app:633a359d958ba7bfcd61680f2223961856cbff0c
 imagePullPolicy: IfNotPresent
 
 # Referenced only -- created by hand, see abc_local_setup/local-kind-setup.md step 9.2.
