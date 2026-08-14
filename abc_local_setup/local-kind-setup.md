@@ -21,29 +21,88 @@ dashboard still runs — it is the API the extension proxies to — it just does
 need its own ingress.
 
 `*.localtest.me` resolves to `127.0.0.1` publicly, so there is nothing to add to
-`/etc/hosts`.
+`/etc/hosts` — provided the browser and the cluster are on the same machine. On
+a remote Ubuntu server they are not, and step 8.2 covers that.
 
 Budget ~30 minutes, most of it image pulls.
 
-Give Docker **4 GB minimum, 6 GB comfortable**. Everything below fits in 4 GB as
-written; Kyverno in step 6 is the piece that pushes it over, so it is opt-in.
-At 4 GB do not add nodes or re-enable the Argo CD components switched off in
-step 5 — the first thing to fail is the API server, with `TLS handshake
-timeout`.
+### macOS or Ubuntu
+
+Both are covered. Almost everything is byte-identical — kind, kubectl and helm
+take the same flags on either, and every manifest, values file and `kubectl`
+call below is shared. What differs is marked where it comes up:
+
+| Area | Difference | Where |
+|---|---|---|
+| Tool install | `brew` vs. release binaries | step 0 |
+| Port 80 | far likelier to be taken on a server | step 1 |
+| Shell quoting | zsh globs `[0]`, bash does not | step 3 |
+| Reaching the UIs | loopback vs. a remote host | step 8.2 |
+
+Memory is the one prerequisite that is genuinely not the same:
+
+- **macOS** — Docker Desktop runs a VM with a hard limit, and that limit is what
+  bites. Raise it to **4 GB minimum, 6 GB comfortable** under Settings →
+  Resources.
+- **Ubuntu** — Docker Engine has no VM and no limit to raise; containers draw on
+  host RAM directly. Just confirm the box has ~4 GB free with `free -h`. When
+  you do run out, there is no friendly Docker error — the kernel OOM killer
+  reaps a process and you see `Exit Code 137` in `kubectl describe`.
+
+Everything below fits in 4 GB as written; Kyverno in step 6 is the piece that
+pushes it over, so it is opt-in. At 4 GB do not add nodes or re-enable the Argo
+CD components switched off in step 5 — the first thing to fail is the API
+server, with `TLS handshake timeout`.
 
 ---
 
 ## 0. Tools
 
-Only four on the host — everything else runs in the cluster:
+Only four on the host — everything else runs in the cluster.
+
+**macOS** — Docker Desktop plus:
 
 ```sh
 brew install kind kubectl helm
 ```
 
-No `argocd` CLI and no `kubectl-argo-rollouts` plugin: syncing, promoting and
-aborting are all done from the UIs. `trivy` and `cosign` are not needed here
-either — they run inside the Jenkins pod, baked into its image in step 7.
+**Ubuntu** (22.04 / 24.04) — none of the three are in the Ubuntu archive, so
+they come from upstream releases. Docker Engine first, if it is not already
+there:
+
+```sh
+curl -fsSL https://get.docker.com | sudo sh
+sudo usermod -aG docker "$USER"
+newgrp docker            # or log out and back in
+```
+
+Without that group change every `docker` and `kind` call needs `sudo`, and a
+cluster created under `sudo` writes its kubeconfig to root's home — `kubectl`
+then reports `connection refused` as your own user, which looks like a broken
+cluster rather than a permissions problem.
+
+```sh
+ARCH=$(dpkg --print-architecture)          # amd64 or arm64
+
+# kind -- pinned to the version verified against kindest/node:v1.33.1 in step 1
+curl -fsSLo /tmp/kind "https://kind.sigs.k8s.io/dl/v0.29.0/kind-linux-${ARCH}"
+sudo install -m 755 /tmp/kind /usr/local/bin/kind
+
+# kubectl -- the 1.33 channel, to match kindest/node:v1.33.1. Do NOT use
+# stable.txt here: it is on 1.36 now, three minors ahead of the node image and
+# outside kubectl's supported one-minor skew.
+curl -fsSLo /tmp/kubectl \
+  "https://dl.k8s.io/release/$(curl -fsSL https://dl.k8s.io/release/stable-1.33.txt)/bin/linux/${ARCH}/kubectl"
+sudo install -m 755 /tmp/kubectl /usr/local/bin/kubectl
+
+# helm
+curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+```
+
+No `argocd` CLI and no `kubectl-argo-rollouts` plugin on either platform:
+syncing, promoting and aborting are all done from the UIs. `trivy` and `cosign`
+are not needed here either — they run inside the Jenkins pod, baked into its
+image in step 7.
 
 The one exception is generating a signing keypair, which happens on your
 machine. Only if you want image signing, and it must be cosign **v2** — v3
@@ -51,10 +110,19 @@ removed `--tlog-upload=false`, which the `Sign Image` stage depends on, and the
 pipeline asserts the major version and fails fast:
 
 ```sh
+# macOS -- Homebrew ships v3, so check what you got
 brew install cosign
 cosign version | grep GitVersion          # must be v2.x
 # if it reports v3, install a v2 release instead:
 #   https://github.com/sigstore/cosign/releases  (pick a v2.x tag)
+```
+
+```sh
+# Ubuntu -- pin v2 directly and the problem does not arise
+curl -fsSLo /tmp/cosign \
+  "https://github.com/sigstore/cosign/releases/download/v2.6.5/cosign-linux-$(dpkg --print-architecture)"
+sudo install -m 755 /tmp/cosign /usr/local/bin/cosign
+cosign version | grep GitVersion
 ```
 
 Confirm the base:
@@ -117,7 +185,10 @@ plus one worker. Each kind node costs roughly 400 MB, so a third is the easiest
 thing to cut at 4 GB — the app's 4 replicas still spread across two.
 
 > **Port 80 in use?** Cluster creation fails. Stop whatever holds it, or change
-> both `hostPort: 80` and the URLs below to `8080`.
+> both `hostPort: 80` and the URLs below to `8080`. On an Ubuntu server this is
+> far likelier than on a Mac — apache2 or nginx often comes pre-installed and
+> already owns the port. `sudo ss -lptn 'sport = :80'` names the process
+> (`sudo lsof -iTCP:80 -sTCP:LISTEN` on macOS).
 
 ---
 
@@ -152,7 +223,10 @@ helm install ingress-nginx ingress-nginx/ingress-nginx \
 
 Two flag details that are not cosmetic. The single quotes are required on zsh
 (the macOS default) — unquoted `tolerations[0]` is read as a glob and the
-command dies with `no matches found`. And `nodeSelector` must use
+command dies with `no matches found` before helm is even reached. Ubuntu's bash
+passes an unmatched glob through untouched, so the quotes are redundant there —
+but harmless, which is why the command above is written once for both. And
+`nodeSelector` must use
 `--set-string`: with plain `--set`, helm types `true` as a boolean and the API
 server rejects the Deployment with `cannot unmarshal bool into ... nodeSelector
 of type string`.
@@ -599,6 +673,59 @@ kubectl -n argocd delete secret argocd-initial-admin-secret
 
 Jenkins keeps its Secret in use, so leave that one alone.
 
+### 8.2 Reaching a remote Ubuntu server
+
+Skip this on a laptop, macOS or Ubuntu, where the browser and the cluster share
+a machine.
+
+The hostnames above work because `*.localtest.me` resolves to `127.0.0.1`. On a
+headless server that is the *server's* loopback, so the `curl` checks pass over
+SSH while your laptop's browser gets nothing. The ingress is fine; the name just
+points at the wrong machine.
+
+Fix it on the laptop, not on the server — one line, and every URL in this
+document keeps working unchanged:
+
+```sh
+# on your LAPTOP, with the server's IP
+echo "203.0.113.10  argocd.localtest.me jenkins.localtest.me notes.localtest.me" \
+  | sudo tee -a /etc/hosts
+```
+
+A local `/etc/hosts` entry beats public DNS, so this overrides the `127.0.0.1`
+answer for those three names only. `Host:` still arrives as
+`argocd.localtest.me`, which is what nginx routes on — anything that rewrites
+the Host header, a plain `http://<server-ip>` included, lands on the default
+backend and 404s.
+
+Two alternatives:
+
+- **SSH tunnel**, if you cannot edit `/etc/hosts` or the server is firewalled.
+  Port 80 locally needs root, and the hostnames still have to resolve to
+  `127.0.0.1`, which `localtest.me` already does:
+
+  ```sh
+  sudo ssh -L 80:localhost:80 user@203.0.113.10 -N
+  ```
+
+- **`sslip.io`**, to skip client-side config entirely — `argocd.203.0.113.10.sslip.io`
+  resolves to that IP for everyone. It means changing the hostname in three
+  places (`server.ingress.hostname` in step 5, `controller.ingress.hostName` and
+  `jenkinsUrl` in step 7, `ingress.host` in `helm/notes-app/values.yaml`) and
+  depending on a public resolver.
+
+Whichever you pick, open port 80 if a firewall is running — a cloud provider's
+security group counts as one too:
+
+```sh
+sudo ufw allow 80/tcp        # only if `sudo ufw status` says active
+```
+
+> Everything here is HTTP with no auth in front of it, and step 5 turns TLS off
+> inside the cluster on purpose. Do not expose that on a public IP. Bind the
+> server to a private network, or use the SSH tunnel, which keeps the whole
+> stack on loopback.
+
 ---
 
 ## 9. Credentials
@@ -1021,6 +1148,21 @@ If Jenkins later has to move, delete the PVC and `helm upgrade` to recreate it
 alone will not bring it back).
 
 **API server unreachable, `TLS handshake timeout`, pods restarting** — memory.
-This whole stack needs **8 GB** given to Docker; at 4 GB the Argo CD server and
-repo-server are OOM-killed in a loop and the API server drops out under load.
-Raise the limit, or drop Kyverno and one worker node.
+At 4 GB the stack fits only as written; add Kyverno, a third node or the Argo CD
+components disabled in step 5 and the server and repo-server get OOM-killed in a
+loop, taking the API server with them. **6 GB** is where it stops being tight.
+Either raise it or drop Kyverno and one worker node.
+
+Where you raise it depends on the platform. On **macOS** it is Docker Desktop's
+VM limit, Settings → Resources. On **Ubuntu** there is no limit to raise —
+containers already have the whole host, so the box itself is too small (or
+something else on it is using the RAM). Confirm which before hunting further:
+
+```sh
+free -h                                   # Ubuntu: host headroom
+kubectl top nodes 2>/dev/null || \
+  docker stats --no-stream $(kind get nodes --name notes-app | tr '\n' ' ')
+```
+
+`kubectl top` needs metrics-server, which this setup does not install, so the
+`docker stats` fallback is the one that will answer.
