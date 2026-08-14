@@ -1,6 +1,6 @@
 # Without a traffic router, canary weight is approximated by replica count.
 # At 4, the steps below land on 1, 2 and 3 pods; at 1 the canary is everything.
-replicaCount: 4
+replicaCount: 2
 
 # Rewritten by the Jenkins 'Update GitOps' stage. Do not hand-edit.
 image: docker.io/jahadulrakib/notes-app:490b7fcd61717752fd413a0676e5e1f27712edc3
