@@ -37,9 +37,11 @@ service:
   targetPort: 8080
 
 ingress:
-  enabled: false
+  enabled: true
   className: nginx
-  host: notes.local
+  # *.localtest.me resolves to 127.0.0.1 publicly, so this works against the
+  # kind cluster with nothing in /etc/hosts. Change it for a real cluster.
+  host: notes.localtest.me
 
 resources:
   requests:

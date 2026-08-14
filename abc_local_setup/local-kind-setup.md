@@ -5,7 +5,9 @@ Rollouts, Kyverno, **Jenkins**, credentials, and the app. Everything that ships
 a Helm chart is installed with Helm. Every step is a command you can paste; no
 files to create by hand.
 
-Four web UIs at the end, all on port 80 through the ingress controller:
+Three web UIs at the end, all on port 80 through the ingress controller, and
+every one of them created by its own Helm chart — no Ingress manifest is
+applied by hand anywhere in this document:
 
 | UI | URL |
 |---|---|
@@ -217,6 +219,17 @@ configs:
 
 server:
   replicas: 1
+
+  # The chart writes the Ingress itself -- no separate manifest to apply. It
+  # reads `server.insecure` above to pick the backend port: true -> port 80
+  # (plain HTTP, nginx terminates), false -> 443, which would need
+  # ssl-passthrough enabled on the controller. Option 2 in the Argo CD docs.
+  ingress:
+    enabled: true
+    ingressClassName: nginx
+    hostname: argocd.localtest.me      # singular `hostname` since chart 7.x;
+                                       # older docs show a `hosts:` list
+
   # Half one: an initContainer downloads the rollout extension bundle into
   # argocd-server, which is what actually renders canary steps, weights and the
   # Promote/Abort buttons inside the Argo CD UI. Without it a Rollout shows as
@@ -256,7 +269,8 @@ helm install argocd argo/argo-cd \
   --wait
 ```
 
-Credentials are in step 8.1, once the ingress exists.
+The UI is on http://argocd.localtest.me as soon as this finishes. Credentials
+are in step 8.1.
 
 ---
 
@@ -484,33 +498,24 @@ needed here. Credentials come next, in step 9.4.
 
 ---
 
-## 8. Ingress for the Argo CD UI
+## 8. Reaching the UIs
 
-Jenkins got its ingress from the chart above. Argo CD needs one manifest. The
-Rollouts dashboard deliberately gets none — the extension reaches it in-cluster.
+Nothing to apply. Both charts wrote their own Ingress — Argo CD's from the
+`server.ingress` block in step 5, Jenkins' from `controller.ingress` in step 7.
+The Rollouts dashboard deliberately gets none; the extension reaches it
+in-cluster.
 
 ```sh
-cat <<'EOF' | kubectl apply -f -
-apiVersion: networking.k8s.io/v1
-kind: Ingress
-metadata:
-  name: argocd-server
-  namespace: argocd
-spec:
-  ingressClassName: nginx
-  rules:
-    - host: argocd.localtest.me
-      http:
-        paths:
-          - path: /
-            pathType: Prefix
-            backend:
-              service:
-                name: argocd-server
-                port:
-                  number: 80
-EOF
+kubectl get ingress -A
 ```
+
+Two rows so far, `argocd-server` and `jenkins`, both with class `nginx`. The
+app's third one arrives with the Argo CD sync in step 10 — also from a chart,
+also nothing to apply by hand.
+
+If Argo CD's row is missing, `server.ingress` landed under a second top-level
+`server:` key in the values file and was silently dropped — the same trap as
+the rollout extension.
 
 ```sh
 for h in argocd jenkins; do
@@ -825,21 +830,26 @@ kubectl -n argocd get application notes-app -w
 > they are recreated immediately and `IfNotPresent` finds it locally. The
 > Rollouts UI has a **Restart** button that does the same thing.
 
-To publish the app on the ingress, edit `helm/notes-app/values.yaml`:
+The app's ingress needs nothing either — `helm/notes-app/values.yaml` ships it
+on, and Argo CD renders and applies it with the rest of the chart:
 
 ```yaml
 ingress:
   enabled: true
+  className: nginx
   host: notes.localtest.me
 ```
 
-Commit and push, or hit **Refresh** in the Argo CD UI to pick up a local change
-once pushed. Argo CD then renders and applies the Ingress itself.
+To serve it on a different host, change that value, commit and push, then hit
+**Refresh** in the Argo CD UI rather than waiting out the 60s poll.
 
-> Do **not** shortcut this with `helm template ... | kubectl apply -f -`. It
-> works for about a minute, then Argo CD sees the live Service and Rollout
-> differing from git, reports `OutOfSync`, and `selfHeal` reverts your Ingress.
-> Anything Argo CD owns has to change through git.
+> Argo CD is the only writer here, so this one is not interchangeable with
+> `--set` or a `helm template ... | kubectl apply -f -`. Either works for about
+> a minute, then Argo CD sees the live state differing from git, reports
+> `OutOfSync`, and `selfHeal` reverts it. Anything Argo CD owns has to change
+> through git — the chart's `values.yaml`, or `spec.source.helm.parameters` in
+> `argocd/application.yaml` if you would rather keep the override out of the
+> chart.
 
 ---
 
@@ -872,8 +882,10 @@ kubectl -n default describe rollout notes-app-notes-app | tail -30
 ```
 
 For real percentage-based splitting instead of pod-count approximation, set
-`rollout.trafficRouting.enabled=true` **and** `ingress.enabled=true`. Rollouts
-then steers by rewriting the stable Ingress and renders a `-canary` Service.
+`rollout.trafficRouting.enabled: true` in `helm/notes-app/values.yaml` and push.
+`ingress.enabled` is already on, which is the other half of the requirement —
+Rollouts steers by rewriting that stable Ingress, and renders a `-canary`
+Service alongside it.
 
 > A paused canary shows the Application as **Progressing**, not Degraded. That
 > is Argo CD's Rollout health check working, not a stuck sync.
@@ -891,10 +903,10 @@ kubectl -n argocd get application notes-app
 kubectl -n default get rollout,svc,pods
 ```
 
-Then eyeball the four UIs:
+Then eyeball the three UIs:
 
 ```sh
-for h in argocd rollouts jenkins notes; do
+for h in argocd jenkins notes; do
   printf '%-10s %s\n' "$h" "$(curl -s -o /dev/null -w '%{http_code}' http://$h.localtest.me)"
 done
 ```
