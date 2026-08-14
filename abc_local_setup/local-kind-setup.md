@@ -1073,7 +1073,79 @@ done
 
 ---
 
-## 13. Teardown
+## 13. Pause and resume
+
+kind nodes are ordinary Docker containers, so the cluster stops and starts like
+one. There is no `kind pause`; `docker stop` is the whole mechanism.
+
+```sh
+# pause -- gives back roughly 3 GB
+docker stop notes-app-control-plane notes-app-worker
+
+# resume -- control-plane FIRST, so etcd and the API server are up before the
+# worker's kubelet starts registering
+docker start notes-app-control-plane
+docker start notes-app-worker
+```
+
+`docker stop`, not `docker pause`. `pause` SIGSTOPs the processes and leaves
+every page resident, so it returns no memory at all — on a 4-6 GB budget that
+is the only resource worth reclaiming. `stop` frees the RAM and keeps the
+container's disk.
+
+Nothing needs re-running afterwards. Port mappings are fixed when the container
+is created, not when it starts, so the API server keeps whatever host port it
+was given and the kubeconfig stays valid:
+
+```sh
+docker inspect notes-app-control-plane \
+  --format '{{range $p, $v := .NetworkSettings.Ports}}{{$p}} -> {{range $v}}{{.HostPort}}{{end}}
+{{end}}'
+kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}'; echo
+```
+
+The second line must match the `6443/tcp` mapping from the first. It will —
+they are the same number before and after a stop.
+
+Surviving the pause: etcd, so every object, Application and Secret; the
+local-path PVCs, including Jenkins' 8 Gi home with its jobs and credentials;
+images side-loaded with `kind load`; and the ingress on port 80.
+
+Expect two to five minutes of churn on resume before everything is `Running`,
+with restart counters climbing and transient `failed calling webhook` errors
+while Kyverno's admission controller is still starting. Wait it out:
+
+```sh
+kubectl get pods -A | grep -vE '1/1 +Running|2/2 +Running|Completed'
+```
+
+> **The nodes may come back on their own.** kind sets `restart=on-failure`,
+> which is exactly right in both directions: an explicit `docker stop` exits
+> cleanly, so they stay down until you start them, but a Docker or OrbStack
+> *daemon* shutdown kills them non-zero and they restart with the daemon. So
+> after `orb stop && orb start`, or a Mac reboot, the cluster is already coming
+> back before you ask for it.
+
+Two neighbouring options:
+
+- **Stop the whole VM** — `orb stop` on OrbStack, or quitting Docker Desktop.
+  Returns more than the cluster's share, and right for when you are done with
+  containers altogether rather than just this cluster.
+- **Keep the API up but idle** — scale the expensive workloads instead. Jenkins
+  is the single biggest consumer at ~700 MB:
+
+  ```sh
+  kubectl -n jenkins scale statefulset jenkins --replicas=0   # and back to 1
+  ```
+
+  Useful when you still want `kubectl` and the Argo CD UI. For a real pause,
+  stopping the nodes is simpler and gives back more.
+
+---
+
+## 14. Teardown
+
+Permanent, unlike step 13:
 
 ```sh
 kind delete cluster --name notes-app
