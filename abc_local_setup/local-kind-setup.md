@@ -397,20 +397,20 @@ RUN curl -fsSL -o /usr/local/bin/cosign \
 USER jenkins
 EOF
 
-docker build -f /tmp/Dockerfile.jenkins -t jenkins-notes-app:local /tmp
-kind load docker-image jenkins-notes-app:local --name notes-app
+docker build -f /tmp/Dockerfile.jenkins -t notes-app-jenkins:local /tmp
+kind load docker-image notes-app-jenkins:local --name notes-app
 ```
 
 ```sh
 cat <<'EOF' >/tmp/jenkins-values.yaml
 controller:
   image:
-    # `kind load docker-image jenkins-notes-app:local` stores it in containerd
-    # under its canonical name, docker.io/library/jenkins-notes-app. Spell it
+    # `kind load docker-image notes-app-jenkins:local` stores it in containerd
+    # under its canonical name, docker.io/library/notes-app-jenkins. Spell it
     # out here or the kubelet looks for a different repo and pulls nothing.
     # An empty registry renders a leading slash and fails outright.
     registry: docker.io
-    repository: library/jenkins-notes-app
+    repository: library/notes-app-jenkins
     tag: local
     # Never reach out -- the image only exists on the nodes, side-loaded.
     pullPolicy: IfNotPresent
@@ -441,17 +441,35 @@ controller:
     ingressClassName: nginx
     hostName: jenkins.localtest.me
 
-  # The Jenkinsfile fails to parse without these. timestamper backs
-  # options { timestamps() }; leave it out and the pipeline dies with
-  # `Invalid option type "timestamps"` before any stage runs.
-  installPlugins:
-    - kubernetes:latest
-    - workflow-aggregator:latest
-    - git:latest
-    - configuration-as-code:latest
+  # `installPlugins` is left unset ON PURPOSE. Setting it REPLACES the chart's
+  # four defaults -- kubernetes, workflow-aggregator, git,
+  # configuration-as-code -- rather than adding to them, and those defaults
+  # ship pinned to versions tested against this chart release.
+  # `additionalPlugins` layers on top and keeps the pins.
+  #
+  # There is no setup wizard here (the chart disables it), so nothing arrives
+  # by itself: this list plus the four defaults is exactly what gets installed.
+  additionalPlugins:
+    # REQUIRED. Backs options { timestamps() }. Without it the pipeline dies
+    # with `Invalid option type "timestamps"` before any stage runs.
+    - timestamper:latest
+
+    # withCredentials() in the Push, Sign and Update GitOps stages. It already
+    # arrives transitively via workflow-aggregator -> pipeline-model-definition,
+    # but it is load-bearing enough here to name rather than inherit.
+    - credentials-binding:latest
+
+    # Not used by the current Jenkinsfile -- it shells out to `docker` and
+    # never calls the docker.* DSL or readYaml/readJSON. Kept because both are
+    # what you reach for first when editing the pipeline.
     - docker-workflow:latest
     - pipeline-utility-steps:latest
-    - timestamper:latest
+
+    # Suggested-set essentials worth having on any Jenkins:
+    - ws-cleanup:latest              # cleanWs(); the PVC is only 8Gi
+    - github:latest                  # commit/branch links back to the repo
+    - antisamy-markup-formatter:latest   # stops raw HTML in descriptions
+    - build-timeout:latest           # wall-clock kill for wedged builds
 
 # No dynamic Kubernetes agents. The chart ships a default pod template, and
 # `agent any` in the Jenkinsfile will happily schedule onto it -- a bare
@@ -491,6 +509,21 @@ kubectl -n jenkins exec jenkins-0 -c jenkins -- sh -c \
 Expect `uid=0(root)` and a real `docker server` version. If docker reports
 `permission denied`, the container is not root or the node it landed on has no
 socket — see the troubleshooting entries at the end.
+
+The plugin list resolves to the chart's four pinned defaults plus the eight
+above — twelve lines, in that order:
+
+```sh
+kubectl -n jenkins get cm jenkins -o jsonpath='{.data.plugins\.txt}'; echo
+```
+
+Plugins are downloaded by the `init` initContainer before Jenkins starts, so a
+misspelled name shows up as the pod stuck in `Init:1/2` — not as a plugin
+quietly missing from the UI later. The reason is in:
+
+```sh
+kubectl -n jenkins logs jenkins-0 -c init
+```
 
 Then in the UI: create a **Pipeline** job pointed at this repo with script path
 `Jenkinsfile`. Polling is declared in the file itself, so no trigger config is
@@ -917,7 +950,7 @@ done
 
 ```sh
 kind delete cluster --name notes-app
-docker rmi jenkins-notes-app:local
+docker rmi notes-app-jenkins:local
 rm -f /tmp/kind-notes-app.yaml /tmp/argocd-values.yaml /tmp/jenkins-values.yaml /tmp/Dockerfile.jenkins
 ```
 
