@@ -2,9 +2,9 @@
 apiVersion: v1
 kind: Service
 metadata:
-  name: {{ include "notes-app.fullname" . }}
+  name: {{ include "common.fullname" . }}
   labels:
-    {{- include "notes-app.labels" . | nindent 4 }}
+    {{- include "common.labels" . | nindent 4 }}
 spec:
   type: {{ .Values.service.type }}
   ports:
@@ -13,16 +13,19 @@ spec:
       protocol: TCP
       name: http
   selector:
-    {{- include "notes-app.selectorLabels" . | nindent 4 }}
+    {{- include "common.selectorLabels" . | nindent 4 }}
 {{- if .Values.rollout.trafficRouting.enabled }}
 ---
-{{- /* Canary Service. Only needed with traffic routing. */ -}}
+{{- /* Canary Service. Only needed with traffic routing.
+       No `-` on the closing brace: `-}}` would eat the newline after the `---`
+       above and render `---apiVersion: v1`, which is not a document separator
+       and fails `helm lint` with "invalid Yaml document separator". */}}
 apiVersion: v1
 kind: Service
 metadata:
-  name: {{ include "notes-app.fullname" . }}-canary
+  name: {{ include "common.fullname" . }}-canary
   labels:
-    {{- include "notes-app.labels" . | nindent 4 }}
+    {{- include "common.labels" . | nindent 4 }}
 spec:
   type: {{ .Values.service.type }}
   ports:
@@ -31,5 +34,5 @@ spec:
       protocol: TCP
       name: http
   selector:
-    {{- include "notes-app.selectorLabels" . | nindent 4 }}
+    {{- include "common.selectorLabels" . | nindent 4 }}
 {{- end }}

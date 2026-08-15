@@ -18,7 +18,7 @@
   </style>
 </head>
 <body>
-  <h1>Notes</h1>
+  <h1>{{ title|default('Notes') }} <small style="color:#888;font-size:.7rem">{{ env|default('dev') }}</small></h1>
 
   <form class="add" method="post" action="{{ url_for('add') }}">
     <input type="text" name="note" placeholder="Write a note..." autofocus>

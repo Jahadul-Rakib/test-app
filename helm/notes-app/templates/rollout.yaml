@@ -2,28 +2,31 @@
 Rollout, not Deployment: the Argo Rollouts controller and CRDs must be
 installed or Argo CD fails with `no matches for kind "Rollout"`.
 */ -}}
+{{- /* Same guard as configmap.yaml: `config:` is an optional block, so it is
+       read through a defaulted local rather than dereferenced directly. */ -}}
+{{- $cfg := .Values.config | default dict -}}
 apiVersion: argoproj.io/v1alpha1
 kind: Rollout
 metadata:
-  name: {{ include "notes-app.fullname" . }}
+  name: {{ include "common.fullname" . }}
   labels:
-    {{- include "notes-app.labels" . | nindent 4 }}
+    {{- include "common.labels" . | nindent 4 }}
 spec:
   replicas: {{ .Values.replicaCount }}
   revisionHistoryLimit: {{ .Values.rollout.revisionHistoryLimit }}
   selector:
     matchLabels:
-      {{- include "notes-app.selectorLabels" . | nindent 6 }}
+      {{- include "common.selectorLabels" . | nindent 6 }}
   strategy:
     canary:
       {{- if .Values.rollout.trafficRouting.enabled }}
       # Rollouts mutates these Services' selectors to steer traffic -- see
       # ignoreDifferences in argocd/application.yaml.
-      stableService: {{ include "notes-app.fullname" . }}
-      canaryService: {{ include "notes-app.fullname" . }}-canary
+      stableService: {{ include "common.fullname" . }}
+      canaryService: {{ include "common.fullname" . }}-canary
       trafficRouting:
         nginx:
-          stableIngress: {{ include "notes-app.fullname" . }}
+          stableIngress: {{ include "common.fullname" . }}
       {{- end }}
       maxSurge: {{ .Values.rollout.maxSurge }}
       maxUnavailable: {{ .Values.rollout.maxUnavailable }}
@@ -31,12 +34,47 @@ spec:
         {{- toYaml .Values.rollout.canary.steps | nindent 8 }}
   template:
     metadata:
+      annotations:
+        {{- /* Restart pods when the ConfigMap changes. A ConfigMap edit alone
+               leaves the pod spec byte-identical, so neither Argo CD nor the
+               Rollouts controller sees a diff and the pods keep serving the
+               old values. Hashing the rendered file into an annotation makes
+               the config part of the pod template, so a change steps through
+               the canary like any other. Mounted files DO refresh in place
+               (~60s), but env vars are read once at exec time and never do. */}}
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
       labels:
-        {{- include "notes-app.selectorLabels" . | nindent 8 }}
+        {{- include "common.selectorLabels" . | nindent 8 }}
     spec:
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- /* Where the pod is allowed to land. On a GPU cluster these three are
+             what separate "the chart asks for a GPU" from "the chart lands on
+             the machine that has one" -- a GPU limit alone only makes the pod
+             Pending if nothing advertises the resource. */}}
+      {{- with (include "common.nodeSelector" .) }}
+      nodeSelector:
+        {{- . | nindent 8 }}
+      {{- end }}
+      {{- with (include "common.tolerations" .) }}
+      tolerations:
+        {{- . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- /* Only needed where the NVIDIA runtime is NOT the containerd default
+             -- the GPU Operator installs a `nvidia` RuntimeClass for exactly
+             that case. Leave empty when `nvidia-ctk runtime configure` ran with
+             --set-as-default, as in gpu-node-setup.md step 4. */}}
+      {{- with .Values.runtimeClassName }}
+      runtimeClassName: {{ . }}
       {{- end }}
       containers:
         - name: {{ .Chart.Name }}
@@ -45,6 +83,17 @@ spec:
           ports:
             - name: http
               containerPort: {{ .Values.service.targetPort }}
+          {{- if $cfg.enabled }}
+          envFrom:
+            - configMapRef:
+                name: {{ include "common.configMapName" . }}
+          {{- end }}
+          {{- if and $cfg.enabled $cfg.files }}
+          volumeMounts:
+            - name: config
+              mountPath: {{ $cfg.mountPath | default "/etc/config" }}
+              readOnly: true
+          {{- end }}
           livenessProbe:
             httpGet:
               path: /healthz
@@ -56,4 +105,10 @@ spec:
               port: http
             initialDelaySeconds: 3
           resources:
-            {{- toYaml .Values.resources | nindent 12 }}
+            {{- include "common.resources" . | nindent 12 }}
+      {{- if and $cfg.enabled $cfg.files }}
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "common.filesConfigMapName" . }}
+      {{- end }}

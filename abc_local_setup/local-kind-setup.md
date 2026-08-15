@@ -49,6 +49,13 @@ Memory is the one prerequisite that is genuinely not the same:
   you do run out, there is no friendly Docker error — the kernel OOM killer
   reaps a process and you see `Exit Code 137` in `kubectl describe`.
 
+> **Bare-metal Ubuntu, or a GPU node?** This document builds a *kind* cluster —
+> Kubernetes inside Docker, one machine, throwaway. For a real Ubuntu server
+> joined to a real cluster, and for anything involving an NVIDIA GPU (driver,
+> container toolkit, device plugin, node labels and taints), see
+> **[gpu-node-setup.md](gpu-node-setup.md)**. Steps 4, 5 and 6 below — Argo
+> Rollouts, Argo CD, Kyverno — are plain Helm installs and carry over unchanged.
+
 Everything below fits in 4 GB as written; Kyverno in step 6 is the piece that
 pushes it over, so it is opt-in. At 4 GB do not add nodes or re-enable the Argo
 CD components switched off in step 5 — the first thing to fail is the API
@@ -146,6 +153,17 @@ Confirm the base:
 docker info >/dev/null && echo "docker ok"
 kind version && kubectl version --client && helm version --short
 ```
+
+### 0.3 Ubuntu bare metal, without kind
+
+Everything in 0.2 installs the *client* tools next to a kind cluster. If the
+Ubuntu box is meant to **be** a cluster node rather than host a nested one —
+which is the case for any machine with a GPU in it — stop here and switch to
+**[gpu-node-setup.md](gpu-node-setup.md)**. It covers containerd, kubeadm, the
+NVIDIA driver and container toolkit, the device plugin, and the cluster-side
+essentials a fresh `kubeadm` cluster does not ship (CNI, storage,
+metrics-server, ingress). Come back for steps 4–6 here, which apply to any
+cluster unchanged.
 
 ---
 

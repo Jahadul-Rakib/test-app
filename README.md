@@ -71,15 +71,82 @@ forever. The write-back commit is stamped `[ci skip]`, and every stage carries
 | `argocd/application.yaml` | Tells Argo CD what to watch |
 | `abc_local_setup/cosign/cosign.*` | Signing keypair (see the note in the setup doc) |
 | `abc_local_setup/local-kind-setup.md` | **Full setup, end to end** — cluster, addons, credentials |
+| `abc_local_setup/gpu-node-setup.md` | **Bare-metal Ubuntu + GPU node** — driver, toolkit, device plugin, cluster essentials |
 
 ## Setup
+
+Two documents, one per target:
 
 **`abc_local_setup/local-kind-setup.md`** builds the whole stack from scratch on
 a local kind cluster — cluster, ingress, Argo CD, Argo Rollouts, Kyverno,
 Jenkins, credentials and the app — as copy-paste commands.
 
-Against a real cluster the same steps apply, minus the kind-specific ingress and
-image side-loading.
+**`abc_local_setup/gpu-node-setup.md`** takes a bare-metal Ubuntu server with an
+NVIDIA card and turns it into a Kubernetes node that can schedule GPUs: driver,
+containerd, NVIDIA Container Toolkit, `kubeadm join`, GPU Operator, node labels
+and taints, time-slicing — plus the cluster-side essentials a fresh `kubeadm`
+cluster does not ship (CNI, storage, metrics-server, ingress, DCGM metrics). Its
+last section rehearses the whole cluster-side half on kind **with no GPU**.
+
+Against a real cluster the kind steps apply minus the kind-specific ingress and
+image side-loading; the Argo CD, Argo Rollouts and Kyverno installs carry over
+verbatim.
+
+## Reusable templates (copy-paste, no dependency)
+
+Two files are written to be **copied into another chart as-is**:
+
+| File | Provides |
+|---|---|
+| `helm/notes-app/templates/_helpers.tpl` | `common.name`, `common.fullname`, `common.labels`, `common.selectorLabels`, `common.configMapName`, `common.filesConfigMapName`, `common.nodeSelector`, `common.tolerations`, `common.resources` |
+| `helm/notes-app/templates/configmap.yaml` | the env + files ConfigMaps |
+
+```sh
+cp helm/notes-app/templates/_helpers.tpl   ../other-project/helm/myapp/templates/
+cp helm/notes-app/templates/configmap.yaml ../other-project/helm/myapp/templates/
+```
+
+That is the whole procedure — no `dependencies:` in `Chart.yaml`, no
+`Chart.lock`, no `helm dependency build`, nothing vendored under `charts/`.
+
+Three properties make this safe:
+
+- **No chart-specific names.** Helpers are defined as `common.*` and every value
+  derives from `.Chart` / `.Release`, so the copy picks up the new chart's name
+  and release automatically. Nothing needs find-and-replace after a copy.
+- **Every values block is optional.** `gpu`, `config`, `nodeSelector`,
+  `tolerations` and `resources` are all read through `| default` guards, so a
+  chart that defines none of them still renders. Without those guards a missing
+  block fails with `nil pointer evaluating interface {}.enabled`, which is the
+  usual reason a copied helper file explodes in its new home.
+- **The full contract is at the top of `_helpers.tpl`**, so the copy carries its
+  own documentation.
+
+`configmap.yaml` depends on `_helpers.tpl` — take both or neither. If you rename
+`configmap.yaml` in the destination chart, update the path in the
+`checksum/config` annotation in `rollout.yaml`, which hashes it **by path**;
+otherwise config changes silently stop restarting pods.
+
+## Configuration and scheduling
+
+`helm/notes-app/values.yaml` carries three blocks beyond the app itself:
+
+- **`config`** — renders `templates/configmap.yaml`. `config.env` becomes
+  environment variables via `envFrom` (the app reads `APP_TITLE`/`APP_ENV` and
+  echoes both from `/healthz`); `config.files` becomes files mounted at
+  `config.mountPath`. Two ConfigMaps, because `envFrom` would otherwise turn a
+  file body into an environment variable. The pod template hashes the rendered
+  ConfigMap into a `checksum/config` annotation — without it a config edit
+  changes nothing in the pod spec, so no rollout is triggered and the pods keep
+  serving the old values.
+- **`nodeSelector` / `tolerations` / `affinity` / `runtimeClassName`** — generic
+  placement, empty by default and omitted from the rendered pod spec.
+- **`gpu`** — off by default. Enabling it adds `nvidia.com/gpu` to the container
+  **limits** (extended resources are limits-only and whole devices only), merges
+  the GPU node selector, and appends the toleration for a
+  `nvidia.com/gpu=present:NoSchedule` taint. All three are required: the limit
+  alone leaves the pod `Pending`, and the selector alone leaves it running
+  without a GPU. Details in `gpu-node-setup.md` step 11.
 
 ## Canary deployment (Argo Rollouts)
 
@@ -149,7 +216,7 @@ every check fails.
 | Checkout | Clean clone of `main`, derives the SHA tag | — |
 | Build Image | `docker build` with OCI labels | Build error |
 | Scan Image | Trivy vuln + secret scan, emits SBOM | HIGH/CRITICAL found |
-| Validate Helm Chart | `helm lint` + `helm template` | Chart renders badly |
+| Validate Helm Chart | `helm lint` + `helm template`, default **and** `gpu.enabled=true` | Chart renders badly |
 | Push Image | Pushes the SHA tag, retries 3× | Registry unreachable |
 | Sign Image | cosign signature + SBOM attachment | Signing fails (skipped if unconfigured) |
 | Update GitOps | Commits the tag to `values.yaml`, retries 3× | 3 failed pushes |

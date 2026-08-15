@@ -194,6 +194,14 @@ pipeline {
                         --set image="$IMAGE_REPOSITORY:$IMAGE_TAG" \
                         > /dev/null
 
+                    # The GPU path is not exercised by the default values, so it
+                    # would rot unnoticed. Renders the extra resource limit,
+                    # nodeSelector and toleration in one pass.
+                    helm template "$HELM_RELEASE" "$HELM_CHART_DIR" \
+                        --set image="$IMAGE_REPOSITORY:$IMAGE_TAG" \
+                        --set gpu.enabled=true \
+                        > /dev/null
+
                     echo "Helm chart validation successful."
                 '''
             }

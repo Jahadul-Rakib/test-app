@@ -50,3 +50,62 @@ resources:
   limits:
     cpu: 200m
     memory: 128Mi
+
+# Non-secret configuration -> ConfigMap(s). See templates/configmap.yaml.
+# A change here restarts the pods through the canary, via the checksum
+# annotation on the pod template.
+config:
+  enabled: true
+
+  # Flat keys, injected as environment variables with envFrom. Values are
+  # quoted at render time, so `8080` and `true` are safe to write unquoted.
+  env:
+    APP_TITLE: "Notes"
+    APP_ENV: "local"
+
+  # Whole file bodies, mounted read-only at mountPath, one file per key. Empty
+  # by default -- no second ConfigMap and no volume is rendered until you add
+  # something here. Bodies are run through `tpl`, so {{ .Release.Name }} and
+  # friends work inside them.
+  files: {}
+  #  banner.txt: |
+  #    Deployed by {{ .Release.Name }}
+  mountPath: /etc/notes-app
+
+podAnnotations: {}
+
+# --- Scheduling -------------------------------------------------------------
+# Generic placement. `gpu` below layers onto these rather than replacing them.
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+# Set only where the NVIDIA runtime is not containerd's default; the GPU
+# Operator installs a RuntimeClass named `nvidia` for that case.
+runtimeClassName: ""
+
+# GPU scheduling. Off by default -- this is a Flask app and needs no GPU; the
+# block exists so the same chart deploys unchanged onto a GPU node. See
+# abc_local_setup/gpu-node-setup.md.
+gpu:
+  enabled: false
+
+  # `nvidia.com/gpu` is what the NVIDIA device plugin advertises. Whole devices
+  # only -- fractions are rejected. To share one physical GPU, turn on
+  # time-slicing in the plugin (gpu-node-setup.md step 8); the resource name
+  # stays the same and each replica just becomes a slice.
+  resourceName: nvidia.com/gpu
+  count: 1
+
+  # Applied by Node Feature Discovery, which ships with the GPU Operator and is
+  # optional with the standalone device plugin. Add gpu.product to pin a model
+  # in a mixed fleet, e.g. "NVIDIA-A100-SXM4-40GB".
+  nodeSelector:
+    nvidia.com/gpu.present: "true"
+
+  # Matches the taint that keeps CPU-only workloads off GPU nodes:
+  #   kubectl taint nodes <node> nvidia.com/gpu=present:NoSchedule
+  tolerations:
+    - key: nvidia.com/gpu
+      operator: Exists
+      effect: NoSchedule

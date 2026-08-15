@@ -1,0 +1,56 @@
+{{- /*
+COPY-PASTE FILE -- pairs with _helpers.tpl. Take both or neither; this file
+calls common.configMapName, common.filesConfigMapName and common.labels from
+there. Nothing below names a specific chart.
+
+Non-secret configuration. Two shapes, two ConfigMaps:
+
+  config.env    -> flat key/value, injected as environment variables (envFrom)
+  config.files  -> whole file bodies, mounted at config.mountPath
+
+Secrets do NOT belong here. A ConfigMap is stored in plain text in etcd and is
+readable by anything with get on the namespace -- use a Secret (and see step 9
+of local-kind-setup.md for how the ones in this project are created).
+
+Both are wired into the pod by rollout.yaml, which also carries a
+`checksum/config` annotation over this file. Without that annotation editing a
+value here updates the ConfigMap and nothing else: running pods keep the old
+env vars until something unrelated restarts them. That annotation hashes this
+file BY PATH, so if you rename it in another chart, update the path in
+rollout.yaml to match or the restart-on-change behaviour silently stops.
+*/ -}}
+{{- /* Guarded so this file is droppable into a chart with no `config:` block at
+       all -- a bare .Values.config.enabled would nil-pointer there. */ -}}
+{{- $cfg := .Values.config | default dict -}}
+{{- if $cfg.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "common.configMapName" . }}
+  labels:
+    {{- include "common.labels" . | nindent 4 }}
+data:
+  {{- range $key, $value := ($cfg.env | default dict) }}
+  {{- /* quote is not cosmetic: an unquoted `true` or `8080` is a YAML bool/int,
+         and the API server rejects a ConfigMap whose data values are not
+         strings with "cannot unmarshal bool into Go value of type string". */}}
+  {{ $key }}: {{ $value | quote }}
+  {{- end }}
+{{- if $cfg.files }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "common.filesConfigMapName" . }}
+  labels:
+    {{- include "common.labels" . | nindent 4 }}
+data:
+  {{- range $name, $content := $cfg.files }}
+  {{- /* tpl re-renders the body as a template, so a file can reference values
+         and helpers -- e.g. {{ .Release.Name }} inside the string in
+         values.yaml. Drop tpl if a file ever needs literal {{ }}. */}}
+  {{ $name }}: |-
+    {{- tpl $content $ | nindent 4 }}
+  {{- end }}
+{{- end }}
+{{- end }}
