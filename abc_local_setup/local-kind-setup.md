@@ -831,6 +831,25 @@ The IDs must match exactly — the `Jenkinsfile` looks them up by ID:
 
 **cosign-key:**
 
+> **Paste the whole block, markers included.** Jenkins renders *Secret text* as
+> a single-line password field, so a multi-line paste arrives with its newlines
+> stripped and cosign rejects it:
+>
+> ```
+> Error: signing [...]: reading key: invalid pem block
+> ```
+>
+> The `Sign Image` stage repairs that case — it locates the BEGIN/END markers
+> and rebuilds the PEM before handing it to cosign, so a flattened or CRLF paste
+> still signs. What it cannot repair is a **truncated** paste (only the first
+> line landing in the field); that fails with a message naming this credential.
+> If you see it, re-copy from `abc_local_setup/cosign/cosign.key`.
+>
+> To sidestep the field entirely, use a **Secret file** credential with
+> `cosign.key` uploaded, and change the binding in the `Jenkinsfile` from
+> `string(...)` to `file(credentialsId: ..., variable: 'COSIGN_KEY_FILE')`,
+> passing `--key "$COSIGN_KEY_FILE"` directly.
+
 ```
 -----BEGIN ENCRYPTED SIGSTORE PRIVATE KEY-----
 eyJrZGYiOnsibmFtZSI6InNjcnlwdCIsInBhcmFtcyI6eyJOIjo2NTUzNiwiciI6

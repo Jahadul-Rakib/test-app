@@ -278,16 +278,76 @@ pipeline {
 
                         echo "$REGISTRY_PASSWORD" | docker login "$REGISTRY" --username "$REGISTRY_USER" --password-stdin
 
+                        # ---- Rebuild the PEM --------------------------------
+                        # Jenkins' "Secret text" field is a single-line password
+                        # input. Pasting a multi-line PEM into it concatenates
+                        # every line into one, and cosign then dies with
+                        # `reading key: invalid pem block` -- Go's pem.Decode
+                        # requires the BEGIN marker on its own line. The body is
+                        # base64 and survives the concatenation intact, so the
+                        # block can be reassembled losslessly.
+                        #
+                        # Also strips CR, which a key pasted from Windows or
+                        # copied out of a rendered web page carries.
+                        PEM_LABEL='ENCRYPTED SIGSTORE PRIVATE KEY'
+                        PEM_BEGIN="-----BEGIN ${PEM_LABEL}-----"
+                        PEM_END="-----END ${PEM_LABEL}-----"
+
+                        KEY_LINES=$(printf '%s\n' "$COSIGN_KEY" | wc -l | tr -d ' ')
+                        echo "cosign key: ${#COSIGN_KEY} chars, ${KEY_LINES} line(s)"
+
+                        # Drop CR only. The markers contain SPACES, so stripping
+                        # whitespace before locating them destroys the very
+                        # thing being searched for.
+                        CLEAN=$(printf '%s' "$COSIGN_KEY" | tr -d '\\r')
+
+                        BODY=""
+                        case "$CLEAN" in
+                            *"$PEM_BEGIN"*"$PEM_END"*)
+                                BODY=${CLEAN#*"$PEM_BEGIN"}
+                                BODY=${BODY%"$PEM_END"*}
+                                # Now safe: the body is base64, which carries no
+                                # meaningful whitespace.
+                                BODY=$(printf '%s' "$BODY" | tr -d ' \\t\\n')
+                                ;;
+                        esac
+
+                        if [ -z "$BODY" ]; then
+                            echo "ERROR: the '$COSIGN_CREDENTIALS_ID' credential is not a cosign private key." >&2
+                            echo "  Expected a PEM bounded by:" >&2
+                            echo "    $PEM_BEGIN" >&2
+                            echo "    $PEM_END" >&2
+                            echo "  Got ${#COSIGN_KEY} chars over ${KEY_LINES} line(s) with no such block." >&2
+                            echo "  A single-line paste is fine and is repaired here; a TRUNCATED" >&2
+                            echo "  paste is not -- re-enter the credential from" >&2
+                            echo "  abc_local_setup/cosign/cosign.key if this persists." >&2
+                            exit 1
+                        fi
+
+                        # Written to a file rather than re-exported, so the
+                        # trailing newline after the END marker is guaranteed --
+                        # some pem.Decode paths reject a block without it. umask
+                        # keeps it 0600; the trap removes it on any exit path,
+                        # including the `set -e` ones above.
+                        COSIGN_KEY_FILE=$(mktemp)
+                        trap 'rm -f "$COSIGN_KEY_FILE"' EXIT
+                        (
+                            umask 077
+                            {
+                                printf '%s\\n' "$PEM_BEGIN"
+                                printf '%s' "$BODY" | fold -w 64
+                                printf '\\n%s\\n' "$PEM_END"
+                            } > "$COSIGN_KEY_FILE"
+                        )
+
                         # --tlog-upload=false: rekor.sigstore.dev is unreachable
                         # with no egress. The Kyverno policy sets
                         # ctlog.ignoreTlog to match -- both or neither.
                         #
-                        # env://COSIGN_KEY, not "$COSIGN_KEY": --key takes a
-                        # reference, and a bare value is read as a FILENAME --
-                        # passing the PEM itself fails with `open -----BEGIN
-                        # ENCRYPTED SIGSTORE PRIVATE KEY-----: ...`.
+                        # A path, not env://COSIGN_KEY: the reassembled block
+                        # above is what cosign must read, not the raw credential.
                         cosign sign --yes --tlog-upload=false \
-                            --key env://COSIGN_KEY "$IMAGE_REPOSITORY:$IMAGE_TAG"
+                            --key "$COSIGN_KEY_FILE" "$IMAGE_REPOSITORY:$IMAGE_TAG"
 
                         cosign attach sbom --sbom sbom-cyclonedx.json "$IMAGE_REPOSITORY:$IMAGE_TAG"
                         docker logout "$REGISTRY"
