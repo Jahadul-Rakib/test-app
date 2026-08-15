@@ -241,7 +241,7 @@ pipeline {
             }
             steps {
                 withCredentials([
-                        file(
+                        string(
                                 credentialsId: env.COSIGN_CREDENTIALS_ID,
                                 variable: 'COSIGN_KEY'
                         ),
@@ -274,8 +274,13 @@ pipeline {
                         # --tlog-upload=false: rekor.sigstore.dev is unreachable
                         # with no egress. The Kyverno policy sets
                         # ctlog.ignoreTlog to match -- both or neither.
+                        #
+                        # env://COSIGN_KEY, not "$COSIGN_KEY": --key takes a
+                        # reference, and a bare value is read as a FILENAME --
+                        # passing the PEM itself fails with `open -----BEGIN
+                        # ENCRYPTED SIGSTORE PRIVATE KEY-----: ...`.
                         cosign sign --yes --tlog-upload=false \
-                            --key "$COSIGN_KEY" "$IMAGE_REPOSITORY:$IMAGE_TAG"
+                            --key env://COSIGN_KEY "$IMAGE_REPOSITORY:$IMAGE_TAG"
 
                         cosign attach sbom --sbom sbom-cyclonedx.json "$IMAGE_REPOSITORY:$IMAGE_TAG"
                         docker logout "$REGISTRY"

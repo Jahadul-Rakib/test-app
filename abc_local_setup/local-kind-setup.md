@@ -34,7 +34,7 @@ call below is shared. What differs is marked where it comes up:
 
 | Area | Difference | Where |
 |---|---|---|
-| Tool install | `brew` vs. release binaries | step 0 |
+| Tool install | `brew` vs. release binaries | step 0.1 / 0.2 |
 | Port 80 | far likelier to be taken on a server | step 1 |
 | Shell quoting | zsh globs `[0]`, bash does not | step 3 |
 | Reaching the UIs | loopback vs. a remote host | step 8.2 |
@@ -58,17 +58,48 @@ server, with `TLS handshake timeout`.
 
 ## 0. Tools
 
-Only four on the host — everything else runs in the cluster.
+Docker, `kind`, `kubectl` and `helm` on the host — everything else runs in the
+cluster. No `argocd` CLI and no `kubectl-argo-rollouts` plugin on either
+platform: syncing, promoting and aborting are all done from the UIs. `trivy` and
+`cosign` are not needed on the host either — they run inside the Jenkins pod,
+baked into its image in step 7.
 
-**macOS** — Docker Desktop plus:
+The one exception is cosign, and only if you want image signing: the keypair is
+generated on your own machine. It must be **v2** — v3 removed
+`--tlog-upload=false`, which the `Sign Image` stage depends on, and the pipeline
+asserts the major version and fails fast.
+
+Follow whichever of the two below matches your machine. Each is complete on its
+own; there is nothing to take from the other.
+
+### 0.1 macOS
+
+Docker Desktop, plus:
 
 ```sh
 brew install kind kubectl helm
 ```
 
-**Ubuntu** (22.04 / 24.04) — none of the three are in the Ubuntu archive, so
-they come from upstream releases. Docker Engine first, if it is not already
-there:
+Optional, for signing only. Homebrew ships cosign v3, so check what you got:
+
+```sh
+brew install cosign
+cosign version | grep GitVersion          # must be v2.x
+# if it reports v3, install a v2 release instead:
+#   https://github.com/sigstore/cosign/releases  (pick a v2.x tag)
+```
+
+Confirm the base:
+
+```sh
+docker info >/dev/null && echo "docker ok"
+kind version && kubectl version --client && helm version --short
+```
+
+### 0.2 Ubuntu (22.04 / 24.04)
+
+None of the three are in the Ubuntu archive, so they come from upstream
+releases. Docker Engine first, if it is not already there:
 
 ```sh
 curl -fsSL https://get.docker.com | sudo sh
@@ -99,26 +130,10 @@ sudo install -m 755 /tmp/kubectl /usr/local/bin/kubectl
 curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
 ```
 
-No `argocd` CLI and no `kubectl-argo-rollouts` plugin on either platform:
-syncing, promoting and aborting are all done from the UIs. `trivy` and `cosign`
-are not needed here either — they run inside the Jenkins pod, baked into its
-image in step 7.
-
-The one exception is generating a signing keypair, which happens on your
-machine. Only if you want image signing, and it must be cosign **v2** — v3
-removed `--tlog-upload=false`, which the `Sign Image` stage depends on, and the
-pipeline asserts the major version and fails fast:
+Optional, for signing only. Pinning v2 directly means the version problem never
+arises:
 
 ```sh
-# macOS -- Homebrew ships v3, so check what you got
-brew install cosign
-cosign version | grep GitVersion          # must be v2.x
-# if it reports v3, install a v2 release instead:
-#   https://github.com/sigstore/cosign/releases  (pick a v2.x tag)
-```
-
-```sh
-# Ubuntu -- pin v2 directly and the problem does not arise
 curl -fsSLo /tmp/cosign \
   "https://github.com/sigstore/cosign/releases/download/v2.6.5/cosign-linux-$(dpkg --print-architecture)"
 sudo install -m 755 /tmp/cosign /usr/local/bin/cosign
@@ -351,12 +366,6 @@ are in step 8.1.
 ## 6. Kyverno (optional — signature enforcement)
 
 Skip if you are not signing yet; nothing else depends on it.
-
-> **At 4 GB, skip this.** Kyverno's four controllers are roughly 500 MB, which
-> is the difference between the stack holding and the API server dropping out.
-> Worse, its webhook fails closed: if the admission pod is OOM-killed, every
-> write to the cluster starts failing with `failed calling webhook`. Come back
-> to this once Docker has 6 GB.
 
 ```sh
 helm install kyverno kyverno/kyverno \
@@ -607,64 +616,15 @@ helm install jenkins jenkins/jenkins \
   --wait --timeout 10m
 ```
 
-Credentials are in step 8.1. Confirm the tools actually made it in:
-
-```sh
-kubectl -n jenkins exec jenkins-0 -c jenkins -- sh -c \
-  'id; docker version --format "docker server {{.Server.Version}}"; helm version --short; trivy --version | head -1; cosign version | grep GitVersion; git --version'
-```
-
-Expect `uid=0(root)` and a real `docker server` version. If docker reports
-`permission denied`, the container is not root or the node it landed on has no
-socket — see the troubleshooting entries at the end.
-
-The plugin list resolves to the chart's four pinned defaults plus the eight
-above — twelve lines, in that order:
-
-```sh
-kubectl -n jenkins get cm jenkins -o jsonpath='{.data.plugins\.txt}'; echo
-```
-
-Plugins are downloaded by the `init` initContainer before Jenkins starts, so a
-misspelled name shows up as the pod stuck in `Init:1/2` — not as a plugin
-quietly missing from the UI later. The reason is in:
-
-```sh
-kubectl -n jenkins logs jenkins-0 -c init
-```
-
-Then in the UI: create a **Pipeline** job pointed at this repo with script path
-`Jenkinsfile`. Polling is declared in the file itself, so no trigger config is
-needed here. Credentials come next, in step 9.4.
-
 ---
 
 ## 8. Reaching the UIs
 
-Nothing to apply. Both charts wrote their own Ingress — Argo CD's from the
-`server.ingress` block in step 5, Jenkins' from `controller.ingress` in step 7.
-The Rollouts dashboard deliberately gets none; the extension reaches it
-in-cluster.
+**Check Ingresses:**
 
 ```sh
 kubectl get ingress -A
 ```
-
-Two rows so far, `argocd-server` and `jenkins`, both with class `nginx`. The
-app's third one arrives with the Argo CD sync in step 10 — also from a chart,
-also nothing to apply by hand.
-
-If Argo CD's row is missing, `server.ingress` landed under a second top-level
-`server:` key in the values file and was silently dropped — the same trap as
-the rollout extension.
-
-```sh
-for h in argocd jenkins; do
-  printf '%-10s %s\n' "$h" "$(curl -s -o /dev/null -w '%{http_code}' http://$h.localtest.me)"
-done
-```
-
-`200` or `302` from each means the UIs are reachable.
 
 ### 8.1 Logging in
 
@@ -839,275 +799,39 @@ imagePullSecrets:
 If the repo ends up public, skip this entirely — the kubelet pulls anonymously
 and never reads the secret.
 
-### 9.3 Cosign keypair — optional, for image signing
-
-Two halves that are easy to conflate: **Jenkins signs** with the private key,
-**Kyverno verifies** with the public one. Signing alone enforces nothing.
-
-A keypair already exists in `cosign/` — `cosign.key` and
-`cosign.password` — and its public half is written into the step 6 policy
-verbatim, so signing works out of the box. Only regenerate if you want your own:
-
-```sh
-cd abc_local_setup/cosign
-cosign generate-key-pair        # prompts for a password -- keep it
-cd -
-```
-
-Print the public half of whatever key you have:
-
-```sh
-cosign public-key --key abc_local_setup/cosign/cosign.key
-```
-
-If you regenerated, **paste that output into the step 6 policy** — over the
-existing `-----BEGIN PUBLIC KEY-----` block, at the same indentation — and
-re-apply it. The policy carries the key literally, so nothing picks up a new one
-on its own and every verification would keep failing against the old key.
-
-Manual check that a signature verifies, without Kyverno in the way:
-
-```sh
-cat <<'EOF' >/tmp/cosign.pub
------BEGIN PUBLIC KEY-----
-MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE9pzDmp26walej+dJG0KmqP82X8EK
-MbGDNyWjJNZhmYd2RUeNZeOYVHyYYcqCBkhNAu6TElNyVW+fC/RX8ON0hA==
------END PUBLIC KEY-----
-EOF
-
-cosign verify --key /tmp/cosign.pub --insecure-ignore-tlog \
-  docker.io/jahadulrakib/notes-app:<sha>
-```
-
-> **These keys are committed to the repo, on purpose.** `cosign.key` and
-> `cosign.password` are tracked in git — not ignored — so this demo is
-> reproducible from a clone with nothing to set up out of band.
->
-> That is fine for a throwaway demo key and wrong everywhere else: anyone with
-> read access to the repo can sign images this cluster will trust. For anything
-> real, generate a fresh pair, keep the private half in the Jenkins credential
-> store only, and add both filenames to `.gitignore`.
-
-### 9.4 Jenkins credentials
+### 9.3 Jenkins credentials
 
 The IDs must match exactly — the `Jenkinsfile` looks them up by ID:
 
-| ID | Kind | Username | Password / content |
-|---|---|---|---|
+| ID | Kind | Username | Password / content                         |
+|---|---|---|--------------------------------------------|
 | `github-token` | Username with password | `Jahadul-Rakib` | `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` |
-| `dockerhub` | Username with password | `jahadulrakib` | `dckr_pat_getuazgIuPPCJFgRfkJQ5_mjRQQ` |
-| `cosign-key` | Secret file | — | upload `abc_local_setup/cosign/cosign.key` |
-| `cosign-key-password` | Secret text | — | contents of `abc_local_setup/cosign/cosign.password` |
+| `dockerhub` | Username with password | `jahadulrakib` | `dckr_pat_getuazgIuPPCJFgRfkJQ5_mjRQQ`     |
+| `cosign-key` | Secret text | — | in below.....                              |
+| `cosign-key-password` | Secret text | — | `jBSXFSWcBmTGn2tfVAA9fUtuRrofq3cCW1c1vDBQ` |
 
-`github-token` needs **write** `repo` scope — the `Update GitOps` stage commits
-the image tag back.
 
-Create the two username/password ones from the shell. Every Jenkins POST needs
-a CSRF crumb, and the crumb is bound to the session cookie, so `-c`/`-b` on the
-same cookie jar is not optional:
+**cosign-key:**
 
-```sh
-export JU=admin
-export JP=$(kubectl -n jenkins get secret jenkins \
-  -o jsonpath='{.data.jenkins-admin-password}' | base64 -d)
-export J=http://jenkins.localtest.me
-
-CRUMB=$(curl -s -u "$JU:$JP" -c /tmp/jcookie "$J/crumbIssuer/api/json" \
-  | sed -n 's/.*"crumb":"\([^"]*\)".*/\1/p')
-
-add_cred() {   # id username secret
-  curl -s -o /dev/null -w "  $1: HTTP %{http_code}\n" \
-    -u "$JU:$JP" -b /tmp/jcookie -H "Jenkins-Crumb: $CRUMB" \
-    --data-urlencode "json={\"\":\"0\",\"credentials\":{\"scope\":\"GLOBAL\",\"id\":\"$1\",\"username\":\"$2\",\"password\":\"$3\",\"\$class\":\"com.cloudbees.plugins.credentials.impl.UsernamePasswordCredentialsImpl\"}}" \
-    "$J/credentials/store/system/domain/_/createCredentials"
-}
-
-add_cred github-token Jahadul-Rakib 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
-add_cred dockerhub    jahadulrakib  dckr_pat_getuazgIuPPCJFgRfkJQ5_mjRQQ
+```
+-----BEGIN ENCRYPTED SIGSTORE PRIVATE KEY-----
+eyJrZGYiOnsibmFtZSI6InNjcnlwdCIsInBhcmFtcyI6eyJOIjo2NTUzNiwiciI6
+OCwicCI6MX0sInNhbHQiOiJJUmpFeTNWeGNUUG5McTRJaFdQMVo2cHR3NjRYWlBQ
+cDNmdWxSNmVvWmVNPSJ9LCJjaXBoZXIiOnsibmFtZSI6Im5hY2wvc2VjcmV0Ym94
+Iiwibm9uY2UiOiJHWGN3dFlhSW11Qld6eHdRN3U5eFdrc2NEa1llc1VtdyJ9LCJj
+aXBoZXJ0ZXh0IjoiK1V1M24wbE05UlFRVk1YTmhoSkc0eWJmUUxFTzIxNndWQzRn
+N0V5ekFlSlZubWpiRzZtN0FVamVXZDlvTzFXK2JZcE5XOGJNWE5naTBWeUR6N1J0
+SWREaEJickg3TTRkWXNWWE4vZVRvdWliQ3NET1ljdUhYcHlKNEk3K2dPMmtiRVA3
+ekVic3ZBVjh6T3lSeWNubFFWK0ErMkpKT09SV2FqTWxseXVMaGxYMWRyT2cvVEFU
+TWtBZ1pJcmZpWnRXcVhPeVh5TmJhR3JEdXc9PSJ9
+-----END ENCRYPTED SIGSTORE PRIVATE KEY-----
 ```
 
-`HTTP 302` is success — Jenkins redirects after creating. Confirm exactly two
-exist, with the IDs spelled right:
+**NOTE:** `github-token` needs **write** `repo` scope — `Update GitOps` commits the image
+tag back.
 
-```sh
-curl -s -u "$JU:$JP" \
-  "$J/credentials/store/system/domain/_/api/json?tree=credentials\[id\]"
-```
 
-The cosign pair is optional and easiest in the UI, since one is a file upload:
-**Manage Jenkins → Credentials → System → Global**.
-
-### 9.5 The pipeline job
-
-```sh
-cat <<'EOF' >/tmp/job.xml
-<?xml version='1.1' encoding='UTF-8'?>
-<flow-definition plugin="workflow-job">
-  <description>notes-app CI/CD</description>
-  <keepDependencies>false</keepDependencies>
-  <definition class="org.jenkinsci.plugins.workflow.cps.CpsScmFlowDefinition" plugin="workflow-cps">
-    <scm class="hudson.plugins.git.GitSCM" plugin="git">
-      <configVersion>2</configVersion>
-      <userRemoteConfigs>
-        <hudson.plugins.git.UserRemoteConfig>
-          <url>https://github.com/Jahadul-Rakib/test-app.git</url>
-          <credentialsId>github-token</credentialsId>
-        </hudson.plugins.git.UserRemoteConfig>
-      </userRemoteConfigs>
-      <branches>
-        <hudson.plugins.git.BranchSpec><name>*/main</name></hudson.plugins.git.BranchSpec>
-      </branches>
-      <extensions/>
-    </scm>
-    <scriptPath>Jenkinsfile</scriptPath>
-    <lightweight>false</lightweight>
-  </definition>
-  <disabled>false</disabled>
-</flow-definition>
-EOF
-
-curl -s -o /dev/null -w '  create: HTTP %{http_code}\n' \
-  -u "$JU:$JP" -b /tmp/jcookie -H "Jenkins-Crumb: $CRUMB" \
-  -H 'Content-Type: application/xml' --data-binary @/tmp/job.xml \
-  "$J/createItem?name=notes-app"
-
-curl -s -o /dev/null -w '  build:  HTTP %{http_code}\n' \
-  -u "$JU:$JP" -b /tmp/jcookie -H "Jenkins-Crumb: $CRUMB" \
-  -X POST "$J/job/notes-app/build"
-```
-
-`200` then `201`. Watch it:
-
-```sh
-curl -s -u "$JU:$JP" "$J/job/notes-app/lastBuild/api/json?tree=number,building,result"
-curl -s -u "$JU:$JP" "$J/job/notes-app/lastBuild/consoleText" | tail -40
-```
-
-Check a Jenkinsfile without running a build — this catches parse errors in
-seconds instead of a failed build:
-
-```sh
-curl -s -u "$JU:$JP" -b /tmp/jcookie -H "Jenkins-Crumb: $CRUMB" \
-  -F "jenkinsfile=<Jenkinsfile" "$J/pipeline-model-converter/validate"
-```
-
-The two cosign entries are optional. The `Sign Image` stage is gated on both
-`COSIGN_CREDENTIALS_ID` and `COSIGN_PASSWORD_CREDENTIALS_ID` being non-empty in
-the `Jenkinsfile` `environment` block, so it stays skipped until you set them:
-
-```groovy
-COSIGN_CREDENTIALS_ID = 'cosign-key'
-COSIGN_PASSWORD_CREDENTIALS_ID = 'cosign-key-password'
-```
-
----
-
-## 10. Deploy the app
-
-```sh
-kubectl apply -f argocd/application.yaml
-kubectl -n argocd get application notes-app -w
-```
-
-> **The image does not exist yet.** `docker.io/jahadulrakib/notes-app` is created
-> by the first Jenkins run, so until then pods sit in `ErrImagePull`. To try the
-> stack without Jenkins, build and side-load — `imagePullPolicy: IfNotPresent`
-> means the kubelet uses the loaded copy and never reaches out:
->
-> ```sh
-> docker build -t docker.io/jahadulrakib/notes-app:latest .
-> kind load docker-image docker.io/jahadulrakib/notes-app:latest --name notes-app
-> kubectl -n default delete pod -l app.kubernetes.io/name=notes-app
-> ```
->
-> Deleting the pods is the plugin-free way to pick up the side-loaded image —
-> they are recreated immediately and `IfNotPresent` finds it locally. The
-> Rollouts UI has a **Restart** button that does the same thing.
-
-The app's ingress needs nothing either — `helm/notes-app/values.yaml` ships it
-on, and Argo CD renders and applies it with the rest of the chart:
-
-```yaml
-ingress:
-  enabled: true
-  className: nginx
-  host: notes.localtest.me
-```
-
-To serve it on a different host, change that value, commit and push, then hit
-**Refresh** in the Argo CD UI rather than waiting out the 60s poll.
-
-> Argo CD is the only writer here, so this one is not interchangeable with
-> `--set` or a `helm template ... | kubectl apply -f -`. Either works for about
-> a minute, then Argo CD sees the live state differing from git, reports
-> `OutOfSync`, and `selfHeal` reverts it. Anything Argo CD owns has to change
-> through git — the chart's `values.yaml`, or `spec.source.helm.parameters` in
-> `argocd/application.yaml` if you would rather keep the override out of the
-> chart.
-
----
-
-## 11. Watch a canary
-
-All of it happens in the Argo CD UI. Open <http://argocd.localtest.me>, the
-`notes-app` Application, then the **Rollout** resource. The extension from
-step 5 renders each step, the current weight, and both ReplicaSets side by side,
-with the controls you need:
-
-| Button | Does |
-|---|---|
-| **Promote** | Skip the current pause and move to the next step |
-| **Promote-Full** | Skip every remaining step, go straight to 100% |
-| **Abort** | Send all traffic back to stable |
-| **Restart** | Recreate pods on the current revision |
-
-If those controls are missing and the Rollout renders as a plain resource, the
-extension did not install — see the troubleshooting note at the end.
-
-A canary holds at 25%, 50% and 75% for 60s each. With traffic routing off (the
-default) those weights are approximated by **replica count** — at 4 replicas
-they land on 1, 2 and 3 pods.
-
-Plain kubectl works for watching, since Rollout is just a CRD:
-
-```sh
-kubectl -n default get rollout notes-app-notes-app -w
-kubectl -n default describe rollout notes-app-notes-app | tail -30
-```
-
-For real percentage-based splitting instead of pod-count approximation, set
-`rollout.trafficRouting.enabled: true` in `helm/notes-app/values.yaml` and push.
-`ingress.enabled` is already on, which is the other half of the requirement —
-Rollouts steers by rewriting that stable Ingress, and renders a `-canary`
-Service alongside it.
-
-> A paused canary shows the Application as **Progressing**, not Degraded. That
-> is Argo CD's Rollout health check working, not a stuck sync.
-
----
-
-## 12. Verify
-
-```sh
-kubectl get nodes
-for ns in ingress-nginx argo-rollouts argocd kyverno jenkins default; do
-  echo "== $ns"; kubectl -n $ns get pods --no-headers 2>/dev/null | awk '{print "   "$1, $3}'
-done
-kubectl -n argocd get application notes-app
-kubectl -n default get rollout,svc,pods
-```
-
-Then eyeball the three UIs:
-
-```sh
-for h in argocd jenkins notes; do
-  printf '%-10s %s\n' "$h" "$(curl -s -o /dev/null -w '%{http_code}' http://$h.localtest.me)"
-done
-```
-
----
-
-## 13. Pause and resume
+## 10. Pause and resume
 
 kind nodes are ordinary Docker containers, so the cluster stops and starts like
 one. There is no `kind pause`; `docker stop` is the whole mechanism.
@@ -1177,9 +901,9 @@ Two neighbouring options:
 
 ---
 
-## 14. Teardown
+## 11. Teardown
 
-Permanent, unlike step 13:
+Permanent, unlike step 10:
 
 ```sh
 kind delete cluster --name notes-app
@@ -1190,87 +914,3 @@ The Jenkins image is pulled from Docker Hub rather than built here, so there is
 nothing local to `docker rmi` — it is just another entry in your image cache.
 
 Everything lives in the cluster, so deleting it removes the lot.
-
----
-
-## Troubleshooting
-
-**`no matches for kind "Rollout"`** — Argo Rollouts missing or installed after
-the Application. Do step 4, then hit **Sync** on the app in the Argo CD UI.
-
-**ingress-nginx `Pending`** — it only schedules on the node labelled
-`ingress-ready=true`. `kubectl get nodes --show-labels`; if absent, the cluster
-was created without the step 1 config.
-
-**Jenkins build fails `docker: not found` or cannot reach the daemon** — the
-socket passthrough is broken. Check the extraMount in step 1 exists, and that
-the pod sees it: `kubectl -n jenkins exec deploy/jenkins -c jenkins -- ls -l /var/run/docker.sock`.
-
-**Jenkins job queues forever** — `controller.numExecutors` is 0. The chart
-defaults to 0 and `agent any` has nowhere to run.
-
-**`ImagePullBackOff`** — either the Docker Hub repo does not exist yet (step 10)
-or it is private and `dockerhub-pull` is missing from the `default` namespace.
-It must live where the **pod** runs, not in `argocd`.
-
-**`ComparisonError` / `authentication required`** — repo credential missing,
-mislabelled, or its URL does not match `repoURL`. Argo CD only reads secrets
-carrying `argocd.argoproj.io/secret-type: repository`.
-
-**Canary stalls, traffic snaps back to stable** — Argo CD reverted the Service
-selector Rollouts rewrote. `argocd/application.yaml` carries `ignoreDifferences`
-on `/spec/selector` plus `RespectIgnoreDifferences=true` to prevent exactly
-this; confirm both are present.
-
-**Docker Hub rate limits** — nodes pull independently of your host login.
-Side-load with `kind load docker-image` if you hit them.
-
-**Rollout shows as a plain resource, no Promote/Abort buttons** — the extension
-needs both halves. Check the initContainer ran and the proxy config landed:
-
-```sh
-kubectl -n argocd get deploy argocd-server \
-  -o jsonpath='{.spec.template.spec.initContainers[*].name}'; echo
-kubectl -n argocd get cm argocd-cm -o jsonpath='{.data.extension\.config}'; echo
-kubectl -n argo-rollouts get svc argo-rollouts-dashboard
-```
-
-A missing `rollout-extension` initContainer usually means a second top-level
-`server:` key in the values file silently overrode the first.
-
-**Every write fails with `failed calling webhook "validate.kyverno.svc-fail"`**
-— Kyverno's webhook fails closed, so if its admission controller is down (OOM
-killed, scaled to 0, still starting) the whole cluster becomes read-only. Get it
-running again, or drop the webhooks if you are removing Kyverno:
-
-```sh
-kubectl -n kyverno get pods
-kubectl delete validatingwebhookconfiguration,mutatingwebhookconfiguration \
-  -l webhook.kyverno.io/managed-by=kyverno
-```
-
-**Jenkins stuck `Pending` with `didn't match PersistentVolume's node affinity`**
-— the local-path provisioner binds the PVC to whichever node first ran the pod.
-If Jenkins later has to move, delete the PVC and `helm upgrade` to recreate it
-(the chart manages the PVC separately from the StatefulSet, so deleting the pod
-alone will not bring it back).
-
-**API server unreachable, `TLS handshake timeout`, pods restarting** — memory.
-At 4 GB the stack fits only as written; add Kyverno, a third node or the Argo CD
-components disabled in step 5 and the server and repo-server get OOM-killed in a
-loop, taking the API server with them. **6 GB** is where it stops being tight.
-Either raise it or drop Kyverno and one worker node.
-
-Where you raise it depends on the platform. On **macOS** it is Docker Desktop's
-VM limit, Settings → Resources. On **Ubuntu** there is no limit to raise —
-containers already have the whole host, so the box itself is too small (or
-something else on it is using the RAM). Confirm which before hunting further:
-
-```sh
-free -h                                   # Ubuntu: host headroom
-kubectl top nodes 2>/dev/null || \
-  docker stats --no-stream $(kind get nodes --name notes-app | tr '\n' ' ')
-```
-
-`kubectl top` needs metrics-server, which this setup does not install, so the
-`docker stats` fallback is the one that will answer.
