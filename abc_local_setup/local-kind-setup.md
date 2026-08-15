@@ -429,8 +429,23 @@ image, so it fetches them to verify.
 
 ## 7. Jenkins
 
-The stock Jenkins image has none of the tools the pipeline needs, so build one
-that does and side-load it into the cluster.
+The stock Jenkins image has none of the tools the pipeline needs. A prebuilt one
+that does is published publicly, so there is nothing to build here — the kubelet
+pulls it like any other image:
+
+```
+docker.io/jahadulrakib/jenkins-devops-kubernetes:lts-jdk21
+```
+
+It is a public repo: no `docker login`, no pull secret, and no `kind load`. The
+manifest covers `linux/amd64` and `linux/arm64`, so the same tag works on an
+Intel server and on Apple Silicon.
+
+<details>
+<summary>What is in it, and how to rebuild your own</summary>
+
+Only needed if you want to change the tool versions. Substitute your own
+`OWNER/REPO` and use that instead of the ref above.
 
 ```sh
 cat <<'EOF' >/tmp/Dockerfile.jenkins
@@ -471,22 +486,41 @@ RUN curl -fsSL -o /usr/local/bin/cosign \
 USER jenkins
 EOF
 
-docker build -f /tmp/Dockerfile.jenkins -t notes-app-jenkins:local /tmp
-kind load docker-image notes-app-jenkins:local --name notes-app
+# --platform is what makes the tag portable. A plain `docker build` on Apple
+# Silicon produces an arm64-only image that lands on an amd64 node as
+# "exec format error". The Dockerfile is arch-aware -- every download derives
+# its URL from `dpkg --print-architecture` -- so both halves build from it
+# unchanged. The amd64 half runs under emulation on an arm64 host: slow, but
+# it does not need a second machine.
+#
+# --push, not --load: a multi-arch manifest cannot live in the local docker
+# image store, only in a registry.
+docker buildx create --name multiarch --driver docker-container --bootstrap
+docker login
+docker buildx build --builder multiarch \
+  --platform linux/amd64,linux/arm64 \
+  -f /tmp/Dockerfile.jenkins \
+  -t OWNER/REPO:lts-jdk21 \
+  --push /tmp
 ```
+
+A repo Docker Hub creates on a first push is public, which is what makes the
+anonymous pull above work. Nothing needs to be flipped in the UI.
+
+</details>
 
 ```sh
 cat <<'EOF' >/tmp/jenkins-values.yaml
 controller:
   image:
-    # `kind load docker-image notes-app-jenkins:local` stores it in containerd
-    # under its canonical name, docker.io/library/notes-app-jenkins. Spell it
-    # out here or the kubelet looks for a different repo and pulls nothing.
-    # An empty registry renders a leading slash and fails outright.
+    # Pulled from Docker Hub. Public, so no imagePullSecret -- contrast with
+    # the app's own image in step 9.2. Registry and repository are split here
+    # because the chart joins them itself; an empty registry renders a leading
+    # slash and fails outright.
     registry: docker.io
-    repository: library/notes-app-jenkins
-    tag: local
-    # Never reach out -- the image only exists on the nodes, side-loaded.
+    repository: jahadulrakib/jenkins-devops-kubernetes
+    tag: lts-jdk21
+    # The tag is immutable in practice, so pull once per node and stop asking.
     pullPolicy: IfNotPresent
 
   # The chart defaults to 0, which leaves `agent any` in the Jenkinsfile
@@ -1149,9 +1183,11 @@ Permanent, unlike step 13:
 
 ```sh
 kind delete cluster --name notes-app
-docker rmi notes-app-jenkins:local
-rm -f /tmp/kind-notes-app.yaml /tmp/argocd-values.yaml /tmp/jenkins-values.yaml /tmp/Dockerfile.jenkins
+rm -f /tmp/kind-notes-app.yaml /tmp/argocd-values.yaml /tmp/jenkins-values.yaml
 ```
+
+The Jenkins image is pulled from Docker Hub rather than built here, so there is
+nothing local to `docker rmi` — it is just another entry in your image cache.
 
 Everything lives in the cluster, so deleting it removes the lot.
 
