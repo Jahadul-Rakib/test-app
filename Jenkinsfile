@@ -44,9 +44,8 @@ pipeline {
         TRIVY_CACHE_DIR = '/var/tmp/jenkins-trivy-cache'
 
         // Optional Cosign signing -- both must be set for the stage to run.
-        COSIGN_CREDENTIALS_ID = ''
-        COSIGN_PASSWORD_CREDENTIALS_ID = ''
-        // v3 removed --tlog-upload=false, which this pipeline depends on.
+        COSIGN_CREDENTIALS_ID = 'cosign-key'
+        COSIGN_PASSWORD_CREDENTIALS_ID = 'cosign-key-password'
         COSIGN_MAJOR_VERSION = '2'
     }
 
