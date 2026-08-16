@@ -91,16 +91,21 @@ prefix left on. Details and the full setup are in
 | `Dockerfile` | Runtime image |
 | `Jenkinsfile` | The CI pipeline |
 | `helm/notes-app/` | The chart Argo CD renders (a Rollout, not a Deployment) |
-| `k8s/metallb/` | MetalLB IPAddressPool + L2Advertisement |
-| `k8s/jenkins/`, `k8s/argocd/` | Helm values for the path-routed installs |
 | `argocd/application.yaml` | Tells Argo CD what to watch |
+| `k3s-lab/README.md` | **3-node K3s on OrbStack** — cluster, addons, Jenkins + Argo CD, end to end |
 | `abc_local_setup/cosign/cosign.*` | Signing keypair (see the note in the setup doc) |
 | `abc_local_setup/local-kind-setup.md` | **Full setup, end to end** — cluster, addons, credentials |
 | `abc_local_setup/gpu-node-setup.md` | **Bare-metal Ubuntu GPU node** — driver, containerd, toolkit, `kubeadm join` |
 
 ## Setup
 
-Two documents, one per target:
+Three documents, one per target:
+
+**`k3s-lab/README.md`** builds a **3-node K3s cluster on OrbStack** with every
+bundled K3s add-on replaced by the production equivalent — Calico, CoreDNS,
+MetalLB, ingress-nginx, OpenEBS — then layers Argo Rollouts, Argo CD and Jenkins
+on top. Its CI builds with **Kaniko**, not a mounted Docker socket, because a
+containerd cluster has no socket to mount. Start here for a multi-node target.
 
 **`abc_local_setup/local-kind-setup.md`** builds the whole stack from scratch on
 a local kind cluster — cluster, ingress, Argo CD, Argo Rollouts, Kyverno,

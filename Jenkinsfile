@@ -1,5 +1,77 @@
+// =============================================================================
+// notes-app CI -- Kubernetes-native, no Docker daemon anywhere.
+//
+// This pipeline builds with KANIKO, not `docker build`. On K3s (and any other
+// containerd cluster) there is no /var/run/docker.sock to mount, so the whole
+// docker-in-Jenkins pattern is unavailable. Kaniko builds an OCI image from a
+// Dockerfile inside an unprivileged container instead.
+//
+// The build/scan/push order is deliberate and is the reason for the tarball:
+//
+//     kaniko --no-push --tarball-path   ->  trivy --input  ->  crane push
+//
+// Kaniko's usual mode builds AND pushes in one shot, which would put an
+// unscanned image in the registry and only then let Trivy look at it. Writing a
+// tarball first keeps the original invariant -- a vulnerable image never
+// reaches the registry -- and makes it stricter than the docker version ever
+// was: crane pushes the exact bytes Trivy scanned, not a rebuild that might
+// differ.
+//
+// Setup, credentials and the cluster this runs on: k3s-lab/README.md
+// =============================================================================
+
 pipeline {
-    agent any
+
+    // Each build gets a throwaway pod. The three containers share
+    // /home/jenkins/agent, so the tarball written by kaniko is visible to trivy
+    // and crane with no artifact passing.
+    agent {
+        kubernetes {
+            defaultContainer 'tools'
+            yaml '''
+apiVersion: v1
+kind: Pod
+spec:
+  # The agent SA the Jenkins chart creates. Nothing here talks to the API
+  # server, but the pod still needs an SA that exists.
+  serviceAccountName: jenkins-agent
+  restartPolicy: Never
+  containers:
+    # helm, trivy, cosign, git -- the same image the controller runs, so the
+    # tooling is pinned in exactly one place.
+    - name: tools
+      image: docker.io/jahadulrakib/jenkins-devops-kubernetes:lts-jdk21
+      command: ["sleep"]
+      args: ["infinity"]
+      resources:
+        requests: {cpu: 100m, memory: 512Mi}
+        limits:   {memory: 1200Mi}
+
+    # Distroless -- there is no /bin/sh, only /busybox. `command: cat` + tty is
+    # the standard trick to keep it alive for `container('kaniko')` steps.
+    - name: kaniko
+      image: gcr.io/kaniko-project/executor:v1.23.2-debug
+      command: ["/busybox/cat"]
+      tty: true
+      # Kaniko unpacks base-image layers onto the container root filesystem, so
+      # it must be root. It does NOT need privileged or a docker socket.
+      securityContext:
+        runAsUser: 0
+      resources:
+        requests: {cpu: 200m, memory: 512Mi}
+        limits:   {memory: 1500Mi}
+
+    # ~20 MB. Pushes the scanned tarball; also what makes "push the artifact you
+    # scanned" possible at all.
+    - name: crane
+      image: gcr.io/go-containerregistry/crane:debug
+      command: ["/busybox/sh", "-c", "sleep infinity"]
+      resources:
+        requests: {cpu: 50m, memory: 128Mi}
+        limits:   {memory: 512Mi}
+'''
+        }
+    }
 
     options {
         buildDiscarder(logRotator(numToKeepStr: '30', artifactNumToKeepStr: '10'))
@@ -47,6 +119,14 @@ pipeline {
         COSIGN_CREDENTIALS_ID = 'cosign-key'
         COSIGN_PASSWORD_CREDENTIALS_ID = 'cosign-key-password'
         COSIGN_MAJOR_VERSION = '2'
+
+        // Where kaniko, crane and cosign all look for registry auth. Set as a
+        // DIRECTORY (they append /config.json). Living in the workspace is what
+        // lets three containers share one login.
+        DOCKER_CONFIG = "${WORKSPACE}/.docker"
+
+        // The build artifact that moves between containers.
+        IMAGE_TARBALL = "${WORKSPACE}/image.tar"
     }
 
     stages {
@@ -92,32 +172,91 @@ pipeline {
             }
         }
 
+        // One login for the whole pod. Kaniko and crane are distroless -- there
+        // is no `docker login` to run in them -- so the config.json they both
+        // read is written by hand here, once.
+        stage('Registry Auth') {
+            when {
+                not { changelog '(?s).*\\[ci skip\\].*' }
+            }
+            steps {
+                withCredentials([
+                        usernamePassword(
+                                credentialsId: env.REGISTRY_CREDENTIALS_ID,
+                                usernameVariable: 'REGISTRY_USER',
+                                passwordVariable: 'REGISTRY_PASSWORD'
+                        )
+                ]) {
+                    sh '''
+                        set -e
+
+                        mkdir -p "$DOCKER_CONFIG"
+
+                        # 0600 before anything is written -- the file holds a
+                        # registry token in reversible base64, not a hash.
+                        umask 077
+
+                        # Docker Hub is addressed by its v1 alias in auth files
+                        # even though pushes go to registry-1.docker.io. Using
+                        # "docker.io" here produces a config kaniko reads
+                        # without error and then 401s on push.
+                        AUTH=$(printf '%s:%s' "$REGISTRY_USER" "$REGISTRY_PASSWORD" | base64 | tr -d '\\n')
+
+                        cat > "$DOCKER_CONFIG/config.json" <<JSON
+{
+  "auths": {
+    "https://index.docker.io/v1/": { "auth": "$AUTH" }
+  }
+}
+JSON
+                        echo "Wrote registry auth for $REGISTRY_USER to \\$DOCKER_CONFIG."
+                    '''
+                }
+            }
+        }
+
         stage('Build Image') {
             when {
                 not { changelog '(?s).*\\[ci skip\\].*' }
             }
             options {
-                timeout(time: 15, unit: 'MINUTES')
+                timeout(time: 20, unit: 'MINUTES')
             }
             steps {
-                sh '''
-                    set -e
+                container('kaniko') {
+                    // /busybox/sh: the kaniko image has no /bin/sh.
+                    sh '''#!/busybox/sh
+                        set -e
 
-                    DOCKER_BUILDKIT=1 docker build \
-                        --pull \
-                        --label "org.opencontainers.image.title=$APP_NAME" \
-                        --label "org.opencontainers.image.revision=$GIT_SHA" \
-                        --label "org.opencontainers.image.source=https://$GIT_REPOSITORY" \
-                        --label "org.opencontainers.image.created=$BUILD_TIMESTAMP" \
-                        --label "org.opencontainers.image.version=$IMAGE_TAG" \
-                        --tag "$IMAGE_REPOSITORY:$IMAGE_TAG" \
-                        .
-                '''
+                        # --no-push + --tarball-path is the whole point: build
+                        # now, push only after Trivy has passed. --destination
+                        # is still required, because it is what stamps the ref
+                        # INTO the tarball -- crane later pushes it under
+                        # exactly this name.
+                        #
+                        # --context dir:// -- the shared workspace, already
+                        # checked out by the tools container.
+                        /kaniko/executor \
+                            --context "dir://$WORKSPACE" \
+                            --dockerfile "$WORKSPACE/Dockerfile" \
+                            --destination "$IMAGE_REPOSITORY:$IMAGE_TAG" \
+                            --no-push \
+                            --tarball-path "$IMAGE_TARBALL" \
+                            --single-snapshot \
+                            --label "org.opencontainers.image.title=$APP_NAME" \
+                            --label "org.opencontainers.image.revision=$GIT_SHA" \
+                            --label "org.opencontainers.image.source=https://$GIT_REPOSITORY" \
+                            --label "org.opencontainers.image.created=$BUILD_TIMESTAMP" \
+                            --label "org.opencontainers.image.version=$IMAGE_TAG"
+
+                        ls -la "$IMAGE_TARBALL"
+                    '''
+                }
             }
         }
 
-        // Runs before Push so a vulnerable image never reaches the registry,
-        // and therefore can never be referenced by the GitOps write-back.
+        // Gates the push. Scans the tarball rather than a registry ref, so
+        // nothing has been published at the point this can still fail.
         stage('Scan Image') {
             when {
                 not { changelog '(?s).*\\[ci skip\\].*' }
@@ -146,25 +285,26 @@ pipeline {
                         SKIP_UPDATE=""
                     fi
 
+                    # --input, NOT --image-src docker: there is no docker daemon
+                    # to read from. This is the kaniko tarball on disk.
                     TRIVY_COMMON="--cache-dir $TRIVY_CACHE_DIR \
-                        --image-src docker \
                         --offline-scan \
                         $SKIP_UPDATE"
 
                     trivy image $TRIVY_COMMON \
+                        --input "$IMAGE_TARBALL" \
                         --severity "$TRIVY_SEVERITY" \
                         --ignore-unfixed \
                         --scanners vuln,secret \
                         --exit-code "$TRIVY_EXIT_CODE" \
                         --format table \
-                        --output trivy-image-report.txt \
-                        "$IMAGE_REPOSITORY:$IMAGE_TAG"
+                        --output trivy-image-report.txt
 
                     # SBOM: lets this image be re-checked against future CVEs.
                     trivy image $TRIVY_COMMON \
+                        --input "$IMAGE_TARBALL" \
                         --format cyclonedx \
-                        --output sbom-cyclonedx.json \
-                        "$IMAGE_REPOSITORY:$IMAGE_TAG"
+                        --output sbom-cyclonedx.json
                 '''
             }
             post {
@@ -217,19 +357,16 @@ pipeline {
                 timeout(time: 15, unit: 'MINUTES')
             }
             steps {
-                withCredentials([
-                        usernamePassword(
-                                credentialsId: env.REGISTRY_CREDENTIALS_ID,
-                                usernameVariable: 'REGISTRY_USER',
-                                passwordVariable: 'REGISTRY_PASSWORD'
-                        )
-                ]) {
-                    sh '''
+                container('crane') {
+                    sh '''#!/busybox/sh
                         set -e
 
-                        echo "$REGISTRY_PASSWORD" | docker login "$REGISTRY" --username "$REGISTRY_USER" --password-stdin
-                        docker push "$IMAGE_REPOSITORY:$IMAGE_TAG"
-                        docker logout "$REGISTRY"
+                        # The bytes Trivy just cleared -- not a rebuild. crane
+                        # reads $DOCKER_CONFIG/config.json for auth, written in
+                        # the Registry Auth stage.
+                        crane push "$IMAGE_TARBALL" "$IMAGE_REPOSITORY:$IMAGE_TAG"
+
+                        crane digest "$IMAGE_REPOSITORY:$IMAGE_TAG"
                     '''
                 }
             }
@@ -255,11 +392,6 @@ pipeline {
                         string(
                                 credentialsId: env.COSIGN_PASSWORD_CREDENTIALS_ID,
                                 variable: 'COSIGN_PASSWORD'
-                        ),
-                        usernamePassword(
-                                credentialsId: env.REGISTRY_CREDENTIALS_ID,
-                                usernameVariable: 'REGISTRY_USER',
-                                passwordVariable: 'REGISTRY_PASSWORD'
                         )]) {
                     sh '''
                         set -e
@@ -276,7 +408,7 @@ pipeline {
                         fi
                         echo "cosign $FOUND"
 
-                        echo "$REGISTRY_PASSWORD" | docker login "$REGISTRY" --username "$REGISTRY_USER" --password-stdin
+                        # No `docker login` -- cosign reads $DOCKER_CONFIG too.
 
                         # ---- Rebuild the PEM --------------------------------
                         # Jenkins' "Secret text" field is a single-line password
@@ -286,9 +418,6 @@ pipeline {
                         # requires the BEGIN marker on its own line. The body is
                         # base64 and survives the concatenation intact, so the
                         # block can be reassembled losslessly.
-                        #
-                        # Also strips CR, which a key pasted from Windows or
-                        # copied out of a rendered web page carries.
                         PEM_LABEL='ENCRYPTED SIGSTORE PRIVATE KEY'
                         PEM_BEGIN="-----BEGIN ${PEM_LABEL}-----"
                         PEM_END="-----END ${PEM_LABEL}-----"
@@ -327,8 +456,7 @@ pipeline {
                         # Written to a file rather than re-exported, so the
                         # trailing newline after the END marker is guaranteed --
                         # some pem.Decode paths reject a block without it. umask
-                        # keeps it 0600; the trap removes it on any exit path,
-                        # including the `set -e` ones above.
+                        # keeps it 0600; the trap removes it on any exit path.
                         COSIGN_KEY_FILE=$(mktemp)
                         trap 'rm -f "$COSIGN_KEY_FILE"' EXIT
                         (
@@ -343,22 +471,18 @@ pipeline {
                         # --tlog-upload=false: rekor.sigstore.dev is unreachable
                         # with no egress. The Kyverno policy sets
                         # ctlog.ignoreTlog to match -- both or neither.
-                        #
-                        # A path, not env://COSIGN_KEY: the reassembled block
-                        # above is what cosign must read, not the raw credential.
                         cosign sign --yes --tlog-upload=false \
                             --key "$COSIGN_KEY_FILE" "$IMAGE_REPOSITORY:$IMAGE_TAG"
 
                         cosign attach sbom --sbom sbom-cyclonedx.json "$IMAGE_REPOSITORY:$IMAGE_TAG"
-                        docker logout "$REGISTRY"
                     '''
                 }
             }
         }
 
         // Deploying is a git commit, not a kubectl call. Argo CD runs inside
-        // the private cluster and pulls this change, so Jenkins never needs a
-        // route to the API server.
+        // the cluster and pulls this change, so Jenkins never needs a route to
+        // the API server.
         stage('Update GitOps') {
             when {
                 not { changelog '(?s).*\\[ci skip\\].*' }
@@ -436,9 +560,12 @@ pipeline {
 
     post {
         always {
+            // No `docker logout` / `docker image rm`: nothing was ever loaded
+            // into a daemon. Removing the auth file and the tarball is the
+            // whole cleanup, and the pod is deleted seconds later anyway.
             sh '''
-                docker logout "$REGISTRY" || true
-                docker image rm -f "$IMAGE_REPOSITORY:$IMAGE_TAG" || true
+                rm -rf "$DOCKER_CONFIG" || true
+                rm -f "$IMAGE_TARBALL" || true
             '''
         }
         success {

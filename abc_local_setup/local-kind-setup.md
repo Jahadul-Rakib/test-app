@@ -114,7 +114,7 @@ helm repo add kyverno       https://kyverno.github.io/kyverno
 helm repo add jenkins       https://charts.jenkins.io
 helm repo update
 
-# 3. Confirm the kind subnet matches k8s/metallb/metallb-config.yaml, and that
+# 3. Confirm the kind subnet matches the pool applied in step 3.4, and that
 #    container IPs are routable from macOS. Do not skip.
 docker network inspect kind --format '{{json .IPAM.Config}}'
 ping -c 2 "$(docker network inspect kind --format '{{range .Containers}}{{.IPv4Address}}{{"\n"}}{{end}}' | head -1 | cut -d/ -f1)"
@@ -123,7 +123,7 @@ ping -c 2 "$(docker network inspect kind --format '{{range .Containers}}{{.IPv4A
 kubectl apply -f https://raw.githubusercontent.com/metallb/metallb/v0.15.3/config/manifests/metallb-native.yaml
 kubectl -n metallb-system wait --for=condition=Available deploy/controller --timeout=300s
 kubectl -n metallb-system rollout status ds/speaker --timeout=300s
-kubectl apply -f k8s/metallb/metallb-config.yaml
+#    the IPAddressPool + L2Advertisement heredoc -- see step 3.4
 
 # 5. Ingress controller on the MetalLB IP
 helm install ingress-nginx ingress-nginx/ingress-nginx \
@@ -141,14 +141,8 @@ helm install argo-rollouts argo/argo-rollouts \
   --namespace argo-rollouts --create-namespace --version 2.41.1 \
   --set dashboard.enabled=true --set controller.replicas=1 --wait
 
-# 7. Argo CD
-helm install argocd argo/argo-cd --namespace argocd --create-namespace \
-  --version 10.3.3 -f k8s/argocd/argocd-values.yaml --wait
-
-# 8. Jenkins
-helm install jenkins jenkins/jenkins --namespace jenkins --create-namespace \
-  --version 5.9.54 -f k8s/jenkins/jenkins-values.yaml \
-  --set controller.jenkinsUrl="http://${LB_IP}/jenkins" --wait --timeout 10m
+# 7. Argo CD      -- values heredoc in step 5
+# 8. Jenkins      -- values heredoc in step 7, needs --set controller.jenkinsUrl
 
 # 9. Credentials -- REQUIRED, see step 9. Then the app:
 kubectl apply -f argocd/application.yaml
@@ -385,7 +379,7 @@ On the machine this was written against those printed subnet
 allocates container addresses from the **low** end of the subnet, so a pool at
 the **high** end cannot collide with a node that joins later.
 
-`k8s/metallb/metallb-config.yaml` in this repo carries that range. **Edit both
+The IPAddressPool heredoc in step 3.4 carries that range. **Edit both
 `addresses` entries if your subnet differs** — an address outside the kind
 subnet gets assigned happily and then answers nothing, because the host has no
 route to it.
@@ -434,8 +428,43 @@ validates the next step lives in the controller.
 
 ### 3.4 Apply the address pool
 
+The range below is **not** arbitrary — it is carved out of the `kind` Docker
+network you inspected in 3.1. Docker hands out container addresses from the LOW
+end of the subnet, so a pool at the high end cannot collide with a node that
+joins later. **Edit both `addresses` entries if your subnet differs.** A pool
+outside the kind subnet is assigned happily by MetalLB and then answers nothing,
+because the host has no route to it.
+
 ```sh
-kubectl apply -f k8s/metallb/metallb-config.yaml
+kubectl apply -f - <<'EOF'
+apiVersion: metallb.io/v1beta1
+kind: IPAddressPool
+metadata:
+  name: kind-pool
+  namespace: metallb-system
+spec:
+  addresses:
+    - 192.168.107.200-192.168.107.250
+  # Every Service of type LoadBalancer draws from here unless it asks for a
+  # specific pool. With one ingress controller fronting everything, exactly one
+  # address is ever consumed -- the other 50 are headroom, not a plan.
+  autoAssign: true
+---
+# L2 mode: a speaker Pod answers ARP for the pool addresses on the node's LAN,
+# so the address resolves to a node MAC and traffic lands on kube-proxy.
+#
+# L2 is the right mode here because there is no router to peer with. BGP mode
+# would need one. The tradeoff is that all traffic for a given address enters
+# through a single elected node -- irrelevant at this scale.
+apiVersion: metallb.io/v1beta1
+kind: L2Advertisement
+metadata:
+  name: kind-l2
+  namespace: metallb-system
+spec:
+  ipAddressPools:
+    - kind-pool
+EOF
 ```
 
 ```sh
@@ -543,16 +572,91 @@ Argo CD UI are dead without it. It needs no ingress of its own.
 ## 5. Argo CD
 
 ```sh
-helm install argocd argo/argo-cd \
+cat <<'EOF' | helm install argocd argo/argo-cd \
   --namespace argocd --create-namespace \
-  --version 10.3.3 \
-  -f k8s/argocd/argocd-values.yaml \
-  --wait
+  --version 10.3.3 -f - --wait
+# Required to get a host-less Ingress rule. `server.ingress.hostname: ""` alone
+# is NOT enough -- the chart falls back to `global.domain`, whose default is
+# argocd.example.com, and you end up with a hostname-bound rule that answers
+# nothing on an IP. Blanking both is what produces HOSTS `*`.
+global:
+  domain: ""
+
+configs:
+  params:
+    # Plain HTTP. Otherwise the server serves a self-signed cert and every
+    # port-forward, CLI call and ingress hop needs --insecure.
+    server.insecure: true
+
+    # --- Path-based routing -------------------------------------------------
+    #   server.rootpath  -- argocd-server strips /argocd from incoming request
+    #                       paths and routes on the remainder, so the backend
+    #                       genuinely serves the subtree. This is why there is
+    #                       NO rewrite-target annotation below.
+    #   server.basehref  -- rewrites <base href> in the served index.html, so
+    #                       the UI's relative asset and API URLs resolve under
+    #                       /argocd instead of /.
+    # Set only rootpath and the page loads blank white: the HTML arrives, then
+    # every JS/CSS request goes to /assets/... and 404s.
+    server.rootpath: /argocd
+    server.basehref: /argocd
+
+  cm:
+    # Poll git every 60s instead of the 180s default. GitHub cannot reach a
+    # local cluster, so webhooks are out and polling is the only trigger.
+    timeout.reconciliation: 60s
+    timeout.reconciliation.jitter: 10s
+    # Lets argocd-server proxy UI calls to the Rollouts dashboard API. Without
+    # it the canary controls in the Argo CD UI are dead.
+    extension.config: |
+      extensions:
+        - name: rollout
+          backend:
+            services:
+              - url: http://argo-rollouts-dashboard.argo-rollouts.svc.cluster.local:3100
+
+server:
+  replicas: 1
+  ingress:
+    enabled: true
+    ingressClassName: nginx
+    path: /argocd
+    # Prefix is correct here -- no regex, because rootpath means the backend
+    # wants the prefix left on.
+    pathType: Prefix
+    # Empty = matches any Host header, so IP access works with no DNS.
+    hostname: ""
+  # initContainer that downloads the rollout extension bundle into
+  # argocd-server -- what renders canary steps, weights and Promote/Abort
+  # inside the Argo CD UI.
+  #
+  # Keep this inside the single `server:` block -- a second top-level `server:`
+  # key silently wins and drops everything above it.
+  extensions:
+    enabled: true
+    extensionList:
+      - name: rollout-extension
+        env:
+          - name: EXTENSION_URL
+            value: https://github.com/argoproj-labs/rollout-extension/releases/download/v0.4.0/extension.tar
+
+# HA defaults will not schedule on kind.
+redis-ha:
+  enabled: false
+controller:
+  replicas: 1
+repoServer:
+  replicas: 1
+
+# Not used by this setup, ~100-150 MB each.
+dex:
+  enabled: false
+notifications:
+  enabled: false
+EOF
 ```
 
-The values live in **`k8s/argocd/argocd-values.yaml`** in this repo, not a
-`/tmp` heredoc, so the setup is reproducible from a clone. Read it — the
-comments explain each setting. The two that matter for path routing:
+The two settings that matter for path routing:
 
 - `configs.params."server.rootpath": /argocd` — argocd-server strips `/argocd`
   from incoming paths and serves the subtree itself, so **no rewrite annotation
@@ -678,9 +782,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         docker-cli git curl ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# docker buildx -- the Build stage sets DOCKER_BUILDKIT=1, and without this
-# plugin the build dies with "BuildKit is enabled but the buildx component is
-# missing or broken". The docker-cli package does not carry it.
+# docker buildx -- REQUIRED, and not because of the DOCKER_BUILDKIT=1 in the
+# Build stage. BuildKit has been the DEFAULT builder since Docker CLI v23, and
+# the docker-cli package does not ship the buildx component that implements it,
+# so a plain `docker build` fails with "BuildKit is enabled but the buildx
+# component is missing or broken" whether or not that variable is set.
+#
+# The only way to drop this ~50 MB is to build with DOCKER_BUILDKIT=0, which
+# selects the classic builder -- deprecated, warns on every run, and slated for
+# removal. Not worth it: this project's Dockerfile uses no BuildKit-only
+# features, but the classic builder is the thing that is going away, not buildx.
 ARG BUILDX_VERSION=v0.36.1
 RUN mkdir -p /usr/libexec/docker/cli-plugins \
     && curl -fsSL -o /usr/libexec/docker/cli-plugins/docker-buildx \
@@ -731,17 +842,100 @@ anonymous pull above work. Nothing needs to be flipped in the UI.
 export LB_IP=$(kubectl -n ingress-nginx get svc ingress-nginx-controller \
   -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
 
-helm install jenkins jenkins/jenkins \
+cat <<'EOF' | helm install jenkins jenkins/jenkins \
   --namespace jenkins --create-namespace \
-  --version 5.9.54 \
-  -f k8s/jenkins/jenkins-values.yaml \
+  --version 5.9.54 -f - \
   --set controller.jenkinsUrl="http://${LB_IP}/jenkins" \
   --wait --timeout 10m
+controller:
+  image:
+    registry: docker.io
+    repository: jahadulrakib/jenkins-devops-kubernetes
+    tag: lts-jdk21
+    pullPolicy: IfNotPresent
+
+  numExecutors: 2
+
+  # Root, so the container can use the mounted docker socket without fighting
+  # group ownership. BOTH levels are required: the chart's
+  # containerSecurityContext.runAsUser overrides the pod-level one.
+  runAsUser: 0
+  fsGroup: 0
+  containerSecurityContext:
+    runAsUser: 0
+    runAsGroup: 0
+    readOnlyRootFilesystem: false
+    allowPrivilegeEscalation: false
+
+  # --- Path-based routing ---------------------------------------------------
+  # THE load-bearing setting. It appends --prefix=/jenkins to the Jenkins JVM,
+  # so Jenkins itself serves under /jenkins and generates every internal link,
+  # redirect and static-asset URL with that prefix already on it.
+  #
+  # This is why there is NO rewrite-target annotation below: the backend
+  # genuinely expects /jenkins/... A rewrite that stripped the prefix would give
+  # a Jenkins that renders once and then 404s every CSS, JS and form POST.
+  #
+  # It also fixes the probes for free -- the chart templates them as
+  # `{{ default "" .Values.controller.jenkinsUriPrefix }}/login`.
+  jenkinsUriPrefix: /jenkins
+
+  ingress:
+    enabled: true
+    ingressClassName: nginx
+    path: /jenkins
+    # Prefix, not ImplementationSpecific (the chart default): /jenkins must also
+    # match /jenkins/, /jenkins/login, /jenkins/static/...
+    pathType: Prefix
+    # hostName intentionally omitted -- no host matches ANY Host header, which
+    # is what makes http://<IP>/jenkins work with no DNS.
+    annotations:
+      # Jenkins file uploads (plugin .hpi, job config) exceed nginx's 1m
+      # default and fail with 413.
+      nginx.ingress.kubernetes.io/proxy-body-size: 50m
+      # Long-poll and CLI-over-HTTP connections idle well past the 60s default.
+      nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+      nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+
+  # `installPlugins` is left unset ON PURPOSE. Setting it REPLACES the chart's
+  # four pinned defaults -- kubernetes, workflow-aggregator, git,
+  # configuration-as-code -- rather than adding to them; additionalPlugins
+  # layers on top and keeps the pins.
+  additionalPlugins:
+    # REQUIRED. Backs options { timestamps() }. Without it the pipeline dies
+    # with `Invalid option type "timestamps"` before any stage runs.
+    - timestamper:latest
+    # REQUIRED. withCredentials() in the Push, Sign and Update GitOps stages.
+    - credentials-binding:latest
+    # Not required, kept deliberately: commit/branch links back to the repo,
+    # and a formatter that stops raw HTML rendering in job descriptions.
+    - github:latest
+    - antisamy-markup-formatter:latest
+
+# No dynamic Kubernetes agents -- the tooling lives in the controller image, and
+# `agent any` would otherwise schedule onto a bare inbound-agent with no docker.
+agent:
+  enabled: false
+
+persistence:
+  storageClass: standard
+  size: 8Gi
+  # Host docker socket, passed through by the kind extraMount.
+  volumes:
+    - name: docker-sock
+      hostPath:
+        path: /var/run/docker.sock
+  mounts:
+    - name: docker-sock
+      mountPath: /var/run/docker.sock
+EOF
 ```
 
-The values live in **`k8s/jenkins/jenkins-values.yaml`** in this repo. Only
-`jenkinsUrl` is passed on the command line, because it needs the live IP —
-everything else is in the file, with comments.
+Only `jenkinsUrl` is passed on the command line, because it needs the live IP.
+
+> On a cluster with **no Docker socket to mount** — K3s and anything else on
+> containerd — this values block does not transfer: drop the `volumes`/`mounts`
+> pair and build with Kaniko instead. See `k3s-lab/README.md`.
 
 ### 7.1 Why Jenkins needs more than an Ingress path
 
@@ -1446,7 +1640,7 @@ kubectl describe svc <name> | sed -n '/Events:/,$p'
 
 Causes, in order of likelihood:
 
-- **No IPAddressPool applied** — `kubectl apply -f k8s/metallb/metallb-config.yaml`.
+- **No IPAddressPool applied** — re-run the step 3.4 heredoc.
 - **Pool exhausted.** The pool is 51 addresses; each LoadBalancer Service takes
   one. This architecture should only ever use **one**. Check for strays:
   `kubectl get svc -A | grep LoadBalancer`.
@@ -1501,7 +1695,7 @@ docker network ls | grep kind
 docker ps --filter name=notes-app
 ```
 
-If the subnet is not what `k8s/metallb/metallb-config.yaml` assumes, the pool is
+If the subnet is not what the step 3.4 pool assumes, the pool is
 outside the network and nothing routes. Recreating the kind cluster can allocate
 a **different** subnet — always re-check this after `kind delete`/`create`, and
 update the pool file to match.
@@ -1577,7 +1771,7 @@ to build absolute redirects. Fix:
 
 ```sh
 helm upgrade jenkins jenkins/jenkins -n jenkins --version 5.9.54 \
-  -f k8s/jenkins/jenkins-values.yaml \
+  --reuse-values \
   --set controller.jenkinsUrl="http://${LB_IP}/jenkins" --wait
 ```
 

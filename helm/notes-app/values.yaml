@@ -1,3 +1,19 @@
+# =============================================================================
+# notes-app -- portable defaults. This file is meant to install unchanged on any
+# cluster: kind, K3s, or a managed one. Nothing here assumes a storage class (the
+# app is stateless), a cloud provider, or a secret that exists beforehand.
+#
+# Exactly three values are cluster-specific. Everything else travels:
+#
+#   ingress.className   what your ingress controller claims  (kubectl get ingressclass)
+#   imagePullSecrets    only for a PRIVATE image; empty by default
+#   image               rewritten by CI, not by hand
+#
+# The one hard prerequisite is Argo Rollouts: templates/rollout.yaml renders a
+# `Rollout`, so without those CRDs any install fails with
+# `no matches for kind "Rollout"`. Install argo-rollouts first.
+# =============================================================================
+
 # Without a traffic router, canary weight is approximated by replica count.
 # At 4, the steps below land on 1, 2 and 3 pods; at 1 the canary is everything.
 replicaCount: 2
@@ -6,9 +22,22 @@ replicaCount: 2
 image: docker.io/jahadulrakib/notes-app:c9f26d59f1253cacd003207d2299d7e59e65bcea
 imagePullPolicy: IfNotPresent
 
-# Referenced only -- created by hand, see abc_local_setup/local-kind-setup.md step 9.2.
-imagePullSecrets:
-  - name: dockerhub-pull
+# EMPTY BY DEFAULT so this chart installs on any cluster with no prior setup.
+#
+# A named secret here must already exist IN THE POD'S NAMESPACE -- it is read by
+# the kubelet, not by Helm or Argo CD, and the chart never creates it. Listing
+# one that does not exist is not a hard failure (the kubelet falls back to an
+# anonymous pull), which is exactly what makes it a bad default: a PRIVATE image
+# then fails as ImagePullBackOff / "pull access denied", several layers from the
+# thing that is actually wrong.
+#
+# Public image  -> leave empty.
+# Private image -> create the secret, then set this:
+#   kubectl create secret docker-registry dockerhub-pull -n <ns> \
+#     --docker-server=https://index.docker.io/v1/ \
+#     --docker-username=<user> --docker-password=<token>
+#   # values: imagePullSecrets: [{name: dockerhub-pull}]
+imagePullSecrets: []
 
 rollout:
   revisionHistoryLimit: 3
@@ -38,6 +67,13 @@ service:
 
 ingress:
   enabled: true
+
+  # The one value to change per cluster. `nginx` is what ingress-nginx installs;
+  # a stock K3s serves `traefik`, EKS `alb`, GKE `gce`. Check with
+  # `kubectl get ingressclass` -- a className no controller claims produces an
+  # Ingress with a permanently empty ADDRESS and no error anywhere.
+  # Set ingress.enabled=false to skip the Ingress entirely and reach the app
+  # through the Service (port-forward, or type: LoadBalancer).
   className: nginx
 
   # Reached at http://<METALLB-IP>/app -- no DNS, no /etc/hosts.
