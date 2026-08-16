@@ -19,7 +19,7 @@
 replicaCount: 2
 
 # Rewritten by the Jenkins 'Update GitOps' stage. Do not hand-edit.
-image: docker.io/jahadulrakib/notes-app:c9f26d59f1253cacd003207d2299d7e59e65bcea
+image: docker.io/jahadulrakib/notes-app:1d94ac6e1936b94f6531e828492da90a8937c526
 imagePullPolicy: IfNotPresent
 
 # EMPTY BY DEFAULT so this chart installs on any cluster with no prior setup.
