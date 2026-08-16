@@ -26,12 +26,12 @@ Then a CI/CD layer on top of that platform (steps 15–19):
 
 Nothing else. No metrics-server, no dashboard, no observability stack.
 
-> **The CI/CD layer does not fit in 8 GB alongside the platform.** The base
-> cluster idles at ~4 GB free and load ~2. Adding Jenkins, Argo CD and Argo
-> Rollouts took this machine to **load 21 with macOS at 117 MB free and 4.8 GB
-> of swap in use**, and every controller with a leader-election lease began
-> restarting. Steps 15–19 are written for a 16 GB machine. On 8 GB, run the
-> platform *or* the CI/CD layer — see the sizing note in step 17.
+> **The CI/CD layer fits in 8 GB, but only if you size Jenkins yourself.** With
+> the stock 1 GB heap this machine hit **load 21, macOS at 117 MB free and
+> 4.8 GB of swap in use**, and every controller holding a leader-election lease
+> began restarting. The platform is not the problem — measured, it is ~1.15 GB
+> of container memory. Jenkins at `-Xmx512m` (step 17) runs permanently
+> alongside it. Read the sizing note in step 17 before you install it.
 
 > **This document was executed, not drafted.** Every command below was run
 > against a real 3-node cluster on an 8 GB M1 while writing it, and the outputs
@@ -1482,10 +1482,6 @@ helm upgrade --install argo-rollouts argo/argo-rollouts \
   --version 2.41.1 \
   --set dashboard.enabled=true \
   --set controller.replicas=1 \
-  --set controller.resources.requests.cpu=25m \
-  --set controller.resources.requests.memory=96Mi \
-  --set dashboard.resources.requests.cpu=10m \
-  --set dashboard.resources.requests.memory=48Mi \
   --wait --timeout 8m
 
 kubectl get crd rollouts.argoproj.io
@@ -1540,8 +1536,6 @@ configs:
 
 server:
   replicas: 1
-  resources:
-    requests: {cpu: 50m, memory: 128Mi}
   ingress:
     enabled: true
     ingressClassName: nginx
@@ -1563,15 +1557,8 @@ server:
 redis-ha: {enabled: false}
 controller:
   replicas: 1
-  resources:
-    requests: {cpu: 100m, memory: 256Mi}
 repoServer:
   replicas: 1
-  resources:
-    requests: {cpu: 50m, memory: 128Mi}
-redis:
-  resources:
-    requests: {cpu: 25m, memory: 64Mi}
 
 # ~100-150 MB each, unused here.
 dex: {enabled: false}
@@ -1654,10 +1641,15 @@ controller:
   # `{{ default "" .Values.controller.jenkinsUriPrefix }}/login`.
   jenkinsUriPrefix: /jenkins
 
-  javaOpts: "-Xms256m -Xmx1024m"
-  resources:
-    requests: {cpu: 200m, memory: 768Mi}
-    limits:   {memory: 1600Mi}
+  # Sized to stay up permanently, not to build fast. A 1 GB heap is the stock
+  # advice and it is what tipped this machine into swap thrash; 512 MB runs the
+  # controller comfortably because it schedules work rather than doing it --
+  # every build runs in its own pod (numExecutors: 0).
+  #
+  # With no Kubernetes memory limit set (see the sizing note), this line is the
+  # ONLY thing bounding the controller. Real usage lands ~100-200 MB above the
+  # heap -- metaspace, thread stacks, code cache -- so budget ~700 MB for it.
+  javaOpts: "-Xms192m -Xmx512m"
 
   ingress:
     enabled: true
@@ -1685,9 +1677,6 @@ controller:
 agent:
   enabled: true
   namespace: jenkins
-  resources:
-    requests: {cpu: 50m, memory: 256Mi}
-    limits:   {cpu: "1", memory: 1Gi}
 
 persistence:
   # NOT "standard" -- that class exists on kind, not here. Step 11 installed
@@ -1723,15 +1712,84 @@ argocd-repo-server        CrashLoopBackOff (7 restarts)
 coredns, metallb, tigera-operator, openebs   all restarting
 ```
 
-Nothing was misconfigured — the machine was simply out of memory, and swap
-thrash starved the liveness probes. If you have 8 GB, pick one:
+Nothing was misconfigured — the machine was out of memory and swap thrash
+starved the liveness probes.
 
-- **Drop the heap**: `--set controller.javaOpts="-Xms128m -Xmx512m"` and
-  `--set controller.resources.limits.memory=900Mi`.
-- **Run Jenkins only when building**:
-  `kubectl -n jenkins scale sts jenkins --replicas=0` between runs. The PVC
-  keeps the config, so it comes back with its jobs intact.
-- **Give the VM more**: `orb config set memory_mib 8192` needs ≥16 GB of host.
+**The one control that matters is `javaOpts`, not Kubernetes resources.** The
+values in this document deliberately set **no** `resources:` requests or limits:
+numbers tuned for an 8 GB laptop are wrong on any other cluster, and this chart
+set is meant to install anywhere. `-Xmx` bounds the JVM directly and travels
+fine, because it describes the process rather than the machine.
+
+Know what you give up. Without `requests`, the scheduler treats every pod as
+costing nothing and will happily stack Jenkins, ingress-nginx, CoreDNS and the
+Argo CD controller onto one node. That is not hypothetical — it is what happened
+here, and the node went `NotReady` with its containerd wedged:
+
+```
+E kubelet.go:2646 "Skipping pod synchronization"
+  err="[container runtime is down, PLEG is not healthy: pleg was last seen
+       active 7m29s ago; threshold is 3m0s]"
+```
+
+Recovery is a service restart, not a rebuild — see the troubleshooting entry:
+
+```sh
+orb -m k3s-worker-1 -u root systemctl restart k3s-agent
+```
+
+If you would rather have the guardrails than the portability, add them at
+install time instead of committing them:
+
+```sh
+helm upgrade jenkins jenkins/jenkins -n jenkins --version 5.9.54 --reuse-values \
+  --set controller.resources.requests.cpu=150m \
+  --set controller.resources.requests.memory=640Mi \
+  --set controller.resources.limits.memory=1Gi
+```
+
+Measuring rather than guessing is what makes either choice informed. Actual
+container memory across all three nodes, with the whole platform running:
+
+```sh
+for m in k3s-server k3s-worker-1 k3s-worker-2; do
+  orb -m "$m" -u root k3s crictl stats --output table
+done
+```
+
+```
+application-controller   133.8MB     calico-node (x3)   ~71MB each
+tigera-operator          104.2MB     coredns (x2)       ~31MB each
+ingress-nginx            105.1MB     calico-typha (x2)  ~31MB each
+calico-kube-controllers   80.9MB     speaker (x3)       ~42MB each
+argocd-server             78.0MB     repo-server         42.0MB
+                                     ~1.15 GB total
+```
+
+The platform is **not** what is heavy — it is ~1.15 GB. The 1 GB Jenkins heap
+was, and it landed while a 1 GB image was still being pulled. At `-Xmx512m` the
+controller sits around 600 MB, total container memory lands near 1.8 GB in a
+5992 MB VM, and it holds.
+
+Two things still worth knowing on 8 GB:
+
+- **macOS gets whatever the VM does not, and there is no "unlimited" setting.**
+  `orb config set memory_mib 0` is rejected outright — `memory must be at least
+  500 MiB`. You are choosing a split, not opting out of one. At `6144` of 8 GB
+  the host is left ~2 GB, which is why the compressor and swap were the first
+  things to suffer; `5120` gives macOS a GB back and the cluster still fits in
+  the ~3.3 GB it actually uses. (`orb config reset` does remove the setting, but
+  it resets **everything**, including `network.subnet4` — which renumbers the
+  nodes and invalidates both the kubeconfig and the MetalLB pool. Not worth it.)
+- **Builds are the spike, not steady state.** A Kaniko pod adds ~1.5 GB while it
+  runs. `numExecutors: 0` keeps that off the controller, but do not expect to
+  run two builds at once here — `disableConcurrentBuilds()` in the Jenkinsfile
+  is load-bearing on this hardware, not just hygiene.
+
+**The honest summary:** 8 GB runs the platform comfortably and the platform plus
+CI/CD only just. Expect the occasional wedged node under build load, and know
+that the fix is `systemctl restart k3s-agent` rather than anything structural.
+16 GB removes the whole class of problem.
 
 ---
 
@@ -1805,8 +1863,21 @@ secret` fails with `AlreadyExists` on a rotation.
 
 ### 18.3 Jenkins credentials
 
-Created in the UI at **Manage Jenkins → Credentials → System → Global**. The IDs
-must match exactly — the `Jenkinsfile` looks them up by ID:
+**All three steps in this section are scripted.** From the repo root:
+
+```sh
+./k3s-lab/setup-credentials.sh
+```
+
+It prompts for the two tokens with echo off, creates both Secrets, and re-runs
+`helm upgrade` so **JCasC** turns them into real Jenkins credentials. Doing it
+declaratively rather than clicking in the UI is what makes them survive a pod
+restart or a PVC rebuild — `additionalExistingSecrets` mounts each key under
+`/run/secrets/additional/`, where JCasC reads it as `${<secret>-<key>}`.
+
+The rest of this section is what the script does, if you would rather do it by
+hand at **Manage Jenkins → Credentials → System → Global**. The IDs must match
+exactly — the `Jenkinsfile` looks them up by ID:
 
 | ID | Kind | Username | Content |
 |---|---|---|---|
@@ -2079,6 +2150,45 @@ Components with a leader-election lease (tigera-operator, openebs provisioner,
 calico-kube-controllers) log `leader election lost` and restart when the API
 stalls. That is a symptom, not the disease.
 
+### A node goes `NotReady` and its containerd stops answering
+
+The failure mode when the host runs out of memory, and the one you are most
+likely to hit once Jenkins is installed. The node is up, `k3s-agent` says
+`active`, and the kubelet still cannot talk to the container runtime:
+
+```sh
+orb -m k3s-worker-1 -u root journalctl -u k3s-agent --no-pager -n 20
+```
+
+```
+E kubelet.go:2646 "Skipping pod synchronization"
+  err="[container runtime is down, PLEG is not healthy: pleg was last seen
+       active 7m29s ago; threshold is 3m0s]"
+E remote_runtime.go:801 "Status from runtime service failed"
+  err="rpc error: code = DeadlineExceeded desc = context deadline exceeded"
+```
+
+`DeadlineExceeded` on *every* runtime call means containerd is starved, not
+crashed — on this setup that is macOS swap thrash, not anything in the cluster.
+Confirm from the host side:
+
+```sh
+top -l 1 -s 0 | grep PhysMem      # "compressor" climbing, "unused" near zero
+sysctl -n vm.swapusage            # used approaching total
+```
+
+The fix is a service restart, and it takes seconds:
+
+```sh
+orb -m k3s-worker-1 -u root systemctl restart k3s-agent
+```
+
+Expect pods to reschedule for a few minutes afterwards. **If the node flaps back
+to `NotReady` within the hour, the restart is treating a symptom** — give macOS
+memory back instead (`orb config set memory_mib 5120`, then `orb stop && orb
+start`, which is the only way the setting applies). On the machine this was
+written on that single change took the compressor from 3696 MB to 1205 MB.
+
 ### "Everything broke after a Mac reboot"
 
 OrbStack renumbered the machines by DHCP; `--node-ip` and the kubeconfig are now
@@ -2159,6 +2269,8 @@ orb doctor
 | Volume "full" early | no quota; the node disk filled | `df -h` on the node |
 | `leader election lost` restarts | API server stalling | see the API-timeout section |
 | `kubectl` times out but the app still serves | management-plane only | `orb -m k3s-server -u root systemctl restart k3s` |
+| Node `NotReady`, `PLEG is not healthy`, runtime `DeadlineExceeded` | containerd starved by host swap thrash | `systemctl restart k3s-agent`; if it recurs, `orb config set memory_mib 5120` |
+| LB address assigned, ARP `(incomplete)`, works from inside the cluster | speakers restarted and lost the L2 election | `kubectl -n metallb-system rollout restart ds/metallb-speaker` |
 
 ---
 
