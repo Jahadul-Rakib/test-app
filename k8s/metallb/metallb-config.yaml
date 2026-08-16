@@ -1,0 +1,42 @@
+# MetalLB address pool for the local kind cluster.
+#
+# The range below is NOT arbitrary -- it is carved out of the `kind` Docker
+# network. Derive it for your machine before applying:
+#
+#   docker network inspect kind --format '{{json .IPAM.Config}}'
+#   docker network inspect kind --format '{{range .Containers}}{{.Name}} {{.IPv4Address}}{{"\n"}}{{end}}'
+#
+# On this machine that reported subnet 192.168.107.0/24, gateway .1, with the
+# kind nodes on .2 and .3. Docker hands out container addresses from the LOW end
+# of the subnet, so a pool at the high end cannot collide with a node that joins
+# later. Adjust both `addresses` entries below if your subnet differs.
+#
+# The pool must live INSIDE the kind subnet. An address outside it is assigned
+# happily by MetalLB and then answers nothing -- the host has no route to it.
+apiVersion: metallb.io/v1beta1
+kind: IPAddressPool
+metadata:
+  name: kind-pool
+  namespace: metallb-system
+spec:
+  addresses:
+    - 192.168.107.200-192.168.107.250
+  # Every Service of type LoadBalancer draws from here unless it asks for a
+  # specific pool. With one ingress controller fronting everything, exactly one
+  # address is ever consumed -- the other 50 are headroom, not a plan.
+  autoAssign: true
+---
+# L2 mode: a speaker Pod answers ARP for the pool addresses on the node's LAN,
+# so the address resolves to a node MAC and traffic lands on kube-proxy.
+#
+# L2 is the right mode here because there is no router to peer with. BGP mode
+# would need one. The tradeoff is that all traffic for a given address enters
+# through a single elected node -- irrelevant at this scale.
+apiVersion: metallb.io/v1beta1
+kind: L2Advertisement
+metadata:
+  name: kind-l2
+  namespace: metallb-system
+spec:
+  ipAddressPools:
+    - kind-pool

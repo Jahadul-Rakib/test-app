@@ -1,3 +1,12 @@
+{{- /*
+Path-based Ingress behind MetalLB + ingress-nginx. One LoadBalancer IP fronts
+every service; this rule claims a path under it.
+
+`host` is optional and empty by default. A rule with NO host matches any Host
+header, which is what lets http://<METALLB-IP>/app work with no DNS and no
+/etc/hosts entry. Set ingress.host later to move to hostname routing without
+touching anything else.
+*/ -}}
 {{- if .Values.ingress.enabled }}
 apiVersion: networking.k8s.io/v1
 kind: Ingress
@@ -5,17 +14,25 @@ metadata:
   name: {{ include "common.fullname" . }}
   labels:
     {{- include "common.labels" . | nindent 4 }}
+  {{- with .Values.ingress.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
 spec:
   ingressClassName: {{ .Values.ingress.className }}
   rules:
-    - host: {{ .Values.ingress.host }}
-      http:
+      {{- /* `http` first so an omitted `host` cannot leave a dangling key.
+             YAML is order-independent, so this renders identically either way. */}}
+    - http:
         paths:
-          - path: /
-            pathType: Prefix
+          - path: {{ .Values.ingress.path }}
+            pathType: {{ .Values.ingress.pathType }}
             backend:
               service:
                 name: {{ include "common.fullname" . }}
                 port:
                   number: {{ .Values.service.port }}
+      {{- with .Values.ingress.host }}
+      host: {{ . }}
+      {{- end }}
 {{- end }}

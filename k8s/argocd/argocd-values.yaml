@@ -1,0 +1,90 @@
+# Argo CD Helm values -- path-based routing behind MetalLB + ingress-nginx.
+#
+# Reached at http://<METALLB-IP>/argocd  (no DNS, no /etc/hosts).
+# Discover the IP with:
+#   kubectl -n ingress-nginx get svc ingress-nginx-controller \
+#     -o jsonpath='{.status.loadBalancer.ingress[0].ip}'
+
+# Required to get a host-less Ingress rule. `server.ingress.hostname: ""` alone
+# is NOT enough -- the chart falls back to `global.domain`, whose default is
+# argocd.example.com, and you end up with a hostname-bound rule that answers
+# nothing on an IP. Blanking both is what produces HOSTS `*`.
+global:
+  domain: ""
+
+configs:
+  params:
+    # Plain HTTP. Otherwise the server serves a self-signed cert and every
+    # port-forward, CLI call and ingress hop needs --insecure.
+    server.insecure: true
+
+    # --- Path-based routing -------------------------------------------------
+    # Both are required, and they do different jobs:
+    #
+    #   server.rootpath  -- argocd-server strips /argocd from incoming request
+    #                       paths and routes on the remainder, so the backend
+    #                       genuinely serves the subtree. This is why there is
+    #                       NO rewrite-target annotation below.
+    #   server.basehref  -- rewrites <base href> in the served index.html, so
+    #                       the UI's relative asset and API URLs resolve under
+    #                       /argocd instead of /.
+    #
+    # Set only rootpath and the page loads with a blank white screen: the HTML
+    # arrives, then every JS/CSS request goes to /assets/... and 404s.
+    server.rootpath: /argocd
+    server.basehref: /argocd
+
+  cm:
+    # Poll git every 60s instead of the 180s default. GitHub cannot reach a
+    # local cluster, so webhooks are out and polling is the only trigger.
+    timeout.reconciliation: 60s
+    timeout.reconciliation.jitter: 10s
+    # Lets argocd-server proxy UI calls to the Rollouts dashboard API. Without
+    # it the canary controls in the Argo CD UI are dead.
+    extension.config: |
+      extensions:
+        - name: rollout
+          backend:
+            services:
+              - url: http://argo-rollouts-dashboard.argo-rollouts.svc.cluster.local:3100
+
+server:
+  replicas: 1
+
+  ingress:
+    enabled: true
+    ingressClassName: nginx
+    path: /argocd
+    # Prefix is correct here -- no regex, because rootpath means the backend
+    # wants the prefix left on.
+    pathType: Prefix
+    # Empty = matches any Host header, so IP access works with no DNS.
+    hostname: ""
+
+  # initContainer that downloads the rollout extension bundle into
+  # argocd-server -- what renders canary steps, weights and Promote/Abort
+  # inside the Argo CD UI.
+  #
+  # Keep this inside the single `server:` block -- a second top-level `server:`
+  # key silently wins and drops everything above it.
+  extensions:
+    enabled: true
+    extensionList:
+      - name: rollout-extension
+        env:
+          - name: EXTENSION_URL
+            value: https://github.com/argoproj-labs/rollout-extension/releases/download/v0.4.0/extension.tar
+
+# HA defaults will not schedule on kind.
+redis-ha:
+  enabled: false
+controller:
+  replicas: 1
+repoServer:
+  replicas: 1
+
+# Not used by this setup, ~100-150 MB each.
+dex:
+  enabled: false
+notifications:
+  enabled: false

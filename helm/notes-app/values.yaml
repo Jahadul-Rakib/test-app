@@ -39,9 +39,29 @@ service:
 ingress:
   enabled: true
   className: nginx
-  # *.localtest.me resolves to 127.0.0.1 publicly, so this works against the
-  # kind cluster with nothing in /etc/hosts. Change it for a real cluster.
-  host: notes.localtest.me
+
+  # Reached at http://<METALLB-IP>/app -- no DNS, no /etc/hosts.
+  #
+  # The regex is the rewrite pair: group 2 captures everything after /app, and
+  # rewrite-target below replaces the whole match with it. So /app/add reaches
+  # the container as /add.
+  #
+  # ImplementationSpecific, not Prefix: this path is a REGEX, and Prefix is
+  # defined as literal element-wise matching. nginx honours the regex either
+  # way, but declaring Prefix would be a lie to any other controller.
+  path: /app(/|$)(.*)
+  pathType: ImplementationSpecific
+
+  # Empty = the rule matches any Host header, which is what makes IP access
+  # work. Set this (and simplify `path` to /) to switch to hostname routing.
+  host: ""
+
+  annotations:
+    # Strip /app before the request reaches gunicorn. The Flask app defines
+    # routes at /, /add, /delete/<id> -- it has no /app prefix of its own, so
+    # without this every request 404s inside the container.
+    nginx.ingress.kubernetes.io/rewrite-target: /$2
+    nginx.ingress.kubernetes.io/use-regex: "true"
 
 resources:
   requests:
@@ -62,6 +82,21 @@ config:
   env:
     APP_TITLE: "Notes"
     APP_ENV: "local"
+
+    # The other half of path-based routing, and the reason no application code
+    # or image rebuild was needed for it.
+    #
+    # The Ingress strips /app, so gunicorn sees PATH_INFO=/ and Flask's routes
+    # match. But url_for() would then emit href="/add" -- absolute, prefix-less
+    # -- and the browser would request http://<IP>/add, which no Ingress rule
+    # claims: 404 on every Add and Delete, from a page that rendered fine.
+    #
+    # gunicorn copies this variable into the WSGI environ as SCRIPT_NAME, which
+    # is exactly what Werkzeug prepends when building URLs. url_for() then emits
+    # /app/add and the forms post back through the Ingress.
+    #
+    # Must match the Ingress path prefix. Change one, change both.
+    SCRIPT_NAME: "/app"
 
   # Whole file bodies, mounted read-only at mountPath, one file per key. Empty
   # by default -- no second ConfigMap and no volume is rendered until you add
