@@ -2309,6 +2309,25 @@ reloads on its own.
 > but it was not this. If the agent prints `Connected` and the controller still
 > waits, look at the transport before the heap.
 
+### The Build Image stage dumps kaniko's help text and fails
+
+There is no error message in the log — just kaniko's entire flag reference,
+then `script returned exit code 1`. That **is** the error: kaniko responds to an
+unrecognised flag by printing usage and exiting 1, and it never names the flag
+it did not like.
+
+Read the dump for the flag you *meant* to pass and check the spelling:
+
+```
+--tar-path string   Path to save the image in as a tarball instead of pushing
+--tarPath string    This flag is deprecated. Please use '--tar-path'.
+```
+
+`--tarball-path` is wrong and cost a full build cycle here. The same trap
+applies to `--snapshot-mode` (not `--snapshotMode`) and `--log-format`. When a
+kaniko stage fails with a wall of usage text, diff your flags against that dump
+before suspecting the registry, the context path, or permissions.
+
 ### "Everything broke after a Mac reboot"
 
 OrbStack renumbered the machines by DHCP; `--node-ip` and the kubeconfig are now
@@ -2390,6 +2409,9 @@ orb doctor
 | `leader election lost` restarts | API server stalling | see the API-timeout section |
 | `kubectl` times out but the app still serves | management-plane only | `orb -m k3s-server -u root systemctl restart k3s` |
 | Node `NotReady`, `PLEG is not healthy`, runtime `DeadlineExceeded` | containerd starved by host swap thrash | `systemctl restart k3s-agent`; if it recurs, `orb config set memory_mib 5120` |
+| Agent logs `Connected`, controller loops `Waiting for agent to connect` | JNLP over TCP 50000 never registers | `--set agent.websocket=true` |
+| Build Image stage prints kaniko's whole help text, exit 1 | an unrecognised kaniko flag; it never says which | check flag spelling against the dump (`--tar-path`, not `--tarball-path`) |
+| Several unrelated pods restart at once, `exit 0` + `context deadline exceeded` | k3s datastore I/O-starved; `/readyz` fails `etcd-readiness` | reduce load; this is the host, not the pods |
 | LB address assigned, ARP `(incomplete)`, works from inside the cluster | speakers restarted and lost the L2 election | `kubectl -n metallb-system rollout restart ds/metallb-speaker` |
 
 ---
