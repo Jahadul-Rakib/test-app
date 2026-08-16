@@ -1559,6 +1559,20 @@ controller:
   replicas: 1
 repoServer:
   replicas: 1
+  # The chart ships timeoutSeconds: 1 on both probes. On hardware this slow
+  # that is not enough for repo-server to answer /healthz while it is still
+  # starting, so the kubelet kills it mid-boot and it never finishes -- a
+  # CrashLoopBackOff whose containers all exit 0, because nothing crashed.
+  # See "argocd-repo-server CrashLoopBackOff with exit 0" in troubleshooting.
+  livenessProbe:
+    initialDelaySeconds: 30
+    timeoutSeconds: 10
+    periodSeconds: 20
+    failureThreshold: 6
+  readinessProbe:
+    initialDelaySeconds: 20
+    timeoutSeconds: 10
+    failureThreshold: 6
 
 # ~100-150 MB each, unused here.
 dex: {enabled: false}
@@ -2188,6 +2202,47 @@ to `NotReady` within the hour, the restart is treating a symptom** — give macO
 memory back instead (`orb config set memory_mib 5120`, then `orb stop && orb
 start`, which is the only way the setting applies). On the machine this was
 written on that single change took the compressor from 3696 MB to 1205 MB.
+
+### `argocd-repo-server` CrashLoopBackOff, but every container exited 0
+
+A crash loop where nothing crashed. The give-away is the termination reason:
+
+```sh
+kubectl -n argocd get pod -l app.kubernetes.io/name=argocd-repo-server \
+  -o jsonpath='{range .items[0].status.containerStatuses[*]}reason={.lastState.terminated.reason} exit={.lastState.terminated.exitCode}{"\n"}{end}'
+```
+
+```
+reason=Completed exit=0
+```
+
+`Completed exit=0` in a CrashLoopBackOff means the **kubelet** stopped it, not
+the process. The events say why:
+
+```
+Warning  Unhealthy  Readiness probe failed: dial tcp 10.42.198.33:8084: connect: connection refused
+Warning  Unhealthy  Liveness probe failed: context deadline exceeded
+Normal   Killing    Container repo-server failed liveness probe, will be restarted
+```
+
+The chart's default `timeoutSeconds: 1` is too tight for this hardware: the
+container cannot answer `/healthz` while it is still starting, so the liveness
+probe kills it before it ever becomes ready, forever. Loosen the probes — this
+is a timing problem, not a memory one, and no resource change fixes it:
+
+```sh
+helm upgrade argocd argo/argo-cd -n argocd --version 10.3.3 --reuse-values \
+  --set repoServer.livenessProbe.initialDelaySeconds=30 \
+  --set repoServer.livenessProbe.timeoutSeconds=10 \
+  --set repoServer.livenessProbe.periodSeconds=20 \
+  --set repoServer.livenessProbe.failureThreshold=6 \
+  --set repoServer.readinessProbe.initialDelaySeconds=20 \
+  --set repoServer.readinessProbe.timeoutSeconds=10 \
+  --set repoServer.readinessProbe.failureThreshold=6
+```
+
+The same reasoning applies to any component that crash-loops with `exit 0`
+after the cluster gets busy — check the probe before you touch anything else.
 
 ### "Everything broke after a Mac reboot"
 
