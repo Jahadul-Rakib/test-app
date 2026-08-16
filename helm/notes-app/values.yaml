@@ -25,11 +25,11 @@ rollout:
     # `- pause: {}` with no duration holds until promoted by hand.
     steps:
       - setWeight: 25
-      - pause: {duration: 60s}
+      - pause: {duration: 10s}
       - setWeight: 50
-      - pause: {duration: 60s}
+      - pause: {duration: 10s}
       - setWeight: 75
-      - pause: {duration: 60s}
+      - pause: {duration: 10s}
 
 service:
   type: ClusterIP
@@ -92,7 +92,7 @@ gpu:
 
   # `nvidia.com/gpu` is what the NVIDIA device plugin advertises. Whole devices
   # only -- fractions are rejected. To share one physical GPU, turn on
-  # time-slicing in the plugin (gpu-node-setup.md step 8); the resource name
+  # time-slicing in the plugin (local-kind-setup.md step 10.6); the resource name
   # stays the same and each replica just becomes a slice.
   resourceName: nvidia.com/gpu
   count: 1

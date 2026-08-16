@@ -72,7 +72,7 @@ spec:
       {{- /* Only needed where the NVIDIA runtime is NOT the containerd default
              -- the GPU Operator installs a `nvidia` RuntimeClass for exactly
              that case. Leave empty when `nvidia-ctk runtime configure` ran with
-             --set-as-default, as in gpu-node-setup.md step 4. */}}
+             --set-as-default, as in gpu-node-setup.md step 7. */}}
       {{- with .Values.runtimeClassName }}
       runtimeClassName: {{ . }}
       {{- end }}

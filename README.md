@@ -71,7 +71,7 @@ forever. The write-back commit is stamped `[ci skip]`, and every stage carries
 | `argocd/application.yaml` | Tells Argo CD what to watch |
 | `abc_local_setup/cosign/cosign.*` | Signing keypair (see the note in the setup doc) |
 | `abc_local_setup/local-kind-setup.md` | **Full setup, end to end** — cluster, addons, credentials |
-| `abc_local_setup/gpu-node-setup.md` | **Bare-metal Ubuntu + GPU node** — driver, toolkit, device plugin, cluster essentials |
+| `abc_local_setup/gpu-node-setup.md` | **Bare-metal Ubuntu GPU node** — driver, containerd, toolkit, `kubeadm join` |
 
 ## Setup
 
@@ -79,14 +79,24 @@ Two documents, one per target:
 
 **`abc_local_setup/local-kind-setup.md`** builds the whole stack from scratch on
 a local kind cluster — cluster, ingress, Argo CD, Argo Rollouts, Kyverno,
-Jenkins, credentials and the app — as copy-paste commands.
+Jenkins, credentials and the app — as copy-paste commands. Its **step 10** is
+the GPU *cluster side* on its own: device plugin or GPU Operator, node labels,
+taints and scheduling, against a cluster that already exists. It runs on kind
+with no GPU by advertising a fake one, so the scheduling behaviour is real.
 
 **`abc_local_setup/gpu-node-setup.md`** takes a bare-metal Ubuntu server with an
-NVIDIA card and turns it into a Kubernetes node that can schedule GPUs: driver,
-containerd, NVIDIA Container Toolkit, `kubeadm join`, GPU Operator, node labels
-and taints, time-slicing — plus the cluster-side essentials a fresh `kubeadm`
-cluster does not ship (CNI, storage, metrics-server, ingress, DCGM metrics). Its
-last section rehearses the whole cluster-side half on kind **with no GPU**.
+NVIDIA card and turns it into a Kubernetes node that can run GPU containers:
+driver, containerd, NVIDIA Container Toolkit, `kubeadm join`. **13 steps, one
+command block each**, plus appendices for k3s, the essentials a fresh `kubeadm`
+cluster lacks (CNI, storage, metrics-server, ingress, DCGM), and troubleshooting.
+
+The two split along a hard line — the node side needs SSH and real hardware, the
+cluster side needs only a kubeconfig:
+
+| Half | Doc |
+|---|---|
+| Driver, containerd, toolkit, join | `gpu-node-setup.md` steps 1–13 |
+| Device plugin, labels, taints, scheduling | `local-kind-setup.md` step 10 |
 
 Against a real cluster the kind steps apply minus the kind-specific ingress and
 image side-loading; the Argo CD, Argo Rollouts and Kyverno installs carry over
@@ -146,7 +156,7 @@ otherwise config changes silently stop restarting pods.
   the GPU node selector, and appends the toleration for a
   `nvidia.com/gpu=present:NoSchedule` taint. All three are required: the limit
   alone leaves the pod `Pending`, and the selector alone leaves it running
-  without a GPU. Details in `gpu-node-setup.md` step 11.
+  without a GPU. Details in `local-kind-setup.md` step 10.5.
 
 ## Canary deployment (Argo Rollouts)
 

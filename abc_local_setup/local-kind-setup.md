@@ -49,12 +49,15 @@ Memory is the one prerequisite that is genuinely not the same:
   you do run out, there is no friendly Docker error — the kernel OOM killer
   reaps a process and you see `Exit Code 137` in `kubectl describe`.
 
-> **Bare-metal Ubuntu, or a GPU node?** This document builds a *kind* cluster —
-> Kubernetes inside Docker, one machine, throwaway. For a real Ubuntu server
-> joined to a real cluster, and for anything involving an NVIDIA GPU (driver,
-> container toolkit, device plugin, node labels and taints), see
-> **[gpu-node-setup.md](gpu-node-setup.md)**. Steps 4, 5 and 6 below — Argo
-> Rollouts, Argo CD, Kyverno — are plain Helm installs and carry over unchanged.
+> **GPUs?** They split in two, and the halves live in different documents.
+> **Step 10 below** is the *cluster side* — device plugin or GPU Operator, node
+> labels, taints, scheduling — everything you do with `kubectl` and `helm`
+> against a cluster that already exists. It runs on this kind cluster with no
+> GPU present, by advertising a fake one. The *node side* — NVIDIA driver,
+> containerd, container toolkit, `kubeadm join` on a bare-metal Ubuntu box — is
+> **[gpu-node-setup.md](gpu-node-setup.md)**, and needs real hardware.
+>
+> Given a cluster someone hands you, step 10 alone is the whole job.
 
 Everything below fits in 4 GB as written; Kyverno in step 6 is the piece that
 pushes it over, so it is opt-in. At 4 GB do not add nodes or re-enable the Argo
@@ -160,10 +163,12 @@ Everything in 0.2 installs the *client* tools next to a kind cluster. If the
 Ubuntu box is meant to **be** a cluster node rather than host a nested one —
 which is the case for any machine with a GPU in it — stop here and switch to
 **[gpu-node-setup.md](gpu-node-setup.md)**. It covers containerd, kubeadm, the
-NVIDIA driver and container toolkit, the device plugin, and the cluster-side
-essentials a fresh `kubeadm` cluster does not ship (CNI, storage,
-metrics-server, ingress). Come back for steps 4–6 here, which apply to any
-cluster unchanged.
+NVIDIA driver and container toolkit, and the essentials a fresh `kubeadm`
+cluster does not ship (CNI, storage, metrics-server, ingress).
+
+Come back for steps 4–6 here — Argo Rollouts, Argo CD and Kyverno are plain Helm
+installs that apply to any cluster unchanged — and for step 10, which is the
+GPU cluster side and equally distro-agnostic.
 
 ---
 
@@ -867,8 +872,286 @@ TWtBZ1pJcmZpWnRXcVhPeVh5TmJhR3JEdXc9PSJ9
 **NOTE:** `github-token` needs **write** `repo` scope — `Update GitOps` commits the image
 tag back.
 
+---
 
-## 10. Pause and resume
+## 10. GPU support (cluster side)
+
+Optional. Nothing else in this document depends on it.
+
+GPU support splits in two, and this section is only the second half:
+
+| Half | Where you do it | Covered by |
+|---|---|---|
+| Driver, containerd, NVIDIA Container Toolkit | on the machine with the card, over SSH | [gpu-node-setup.md](gpu-node-setup.md) steps 1–13 |
+| Device plugin, labels, taints, scheduling | against the API server, `kubectl` and `helm` | **here** |
+
+The split is the whole idea: the host owns the hardware, and Kubernetes only
+ever learns about it second-hand. A device plugin running as a DaemonSet is what
+turns a `/dev/nvidia0` on some node into a countable `nvidia.com/gpu` the
+scheduler can allocate. So "the cluster side" is a real, self-contained job —
+given a cluster whose nodes are already prepared, everything below is done
+without ever logging into one.
+
+**This kind cluster has no GPU.** Step 10.2 advertises a fake one. That is not a
+toy: the scheduler treats a fake extended resource exactly like a real one, so
+every selector, toleration, limit and failure message below behaves identically.
+Only the compute is missing.
+
+### 10.1 Which path are you on?
+
+```sh
+kubectl get nodes -o custom-columns=\
+NAME:.metadata.name,GPU:.status.capacity.'nvidia\.com/gpu'
+```
+
+| Output | Meaning | Go to |
+|---|---|---|
+| a number | a device plugin is already running; node side is done | 10.4 |
+| `<none>`, node **has** a card | nothing is advertising it | 10.3 |
+| `<none>`, no card (this kind cluster) | nothing to advertise | 10.2 |
+
+### 10.2 Advertise a fake GPU — no hardware
+
+Kubernetes lets you PATCH an arbitrary extended resource into a node's status,
+which is the documented way to advertise non-standard hardware. Pods asking for
+`nvidia.com/gpu` then schedule and run:
+
+```sh
+NODE=$(kubectl get nodes -o name | grep worker | head -1 | cut -d/ -f2)
+
+kubectl proxy --port=8001 &
+sleep 2
+
+# ~1 is the JSON-Pointer escape for the "/" in nvidia.com/gpu. Unescaped, the
+# API server reads it as a path separator and rejects the patch.
+curl -s --header "Content-Type: application/json-patch+json" --request PATCH \
+  --data '[{"op":"add","path":"/status/capacity/nvidia.com~1gpu","value":"2"}]' \
+  "http://localhost:8001/api/v1/nodes/${NODE}/status" >/dev/null
+
+kill %1
+
+kubectl get node "$NODE" -o jsonpath='{.status.capacity}' | tr ',' '\n' | grep nvidia
+```
+
+GPU Feature Discovery is not running either, so add by hand the labels it would
+have written — the chart selects on `nvidia.com/gpu.present`:
+
+```sh
+kubectl label node "$NODE" nvidia.com/gpu.present=true --overwrite
+kubectl label node "$NODE" nvidia.com/gpu.count=2      --overwrite
+```
+
+> **Do not also install the GPU Operator or the device plugin on this cluster.**
+> Both probe for real devices, find none and crash-loop, and the plugin
+> overwrites the fake capacity above on the way down. The fake resource and a
+> real plugin are alternatives, never both.
+
+The patch survives until the node object is rebuilt; recreating the kind cluster
+clears it. Skip to 10.4.
+
+### 10.3 Install a device plugin — real hardware
+
+Two options. **Install one, not both** — two plugins fight over the same devices
+and the node flaps between advertising and withdrawing them.
+
+| | GPU Operator | Standalone device plugin |
+|---|---|---|
+| Installs | driver, toolkit, plugin, GFD, DCGM metrics, MIG manager | the plugin, and that is all |
+| Node labels | yes, via Node Feature Discovery | only with `gfd.enabled=true` |
+| Footprint | ~8 pods per GPU node + an operator | one DaemonSet |
+| Use when | a real or growing GPU fleet | one node, or a tight cluster |
+
+The Operator is the production answer, and the one to name in an interview: it
+makes GPU nodes reproducible and self-describing instead of hand-built.
+
+```sh
+helm repo add nvidia https://helm.ngc.nvidia.com/nvidia
+helm repo update
+helm search repo nvidia/gpu-operator --versions | head -5   # pin from this
+
+helm install gpu-operator nvidia/gpu-operator \
+  --namespace gpu-operator --create-namespace \
+  --version <VERSION_FROM_ABOVE> \
+  --set driver.enabled=false \
+  --set toolkit.enabled=false \
+  --wait --timeout 10m
+```
+
+> **Both `false` flags are load-bearing.** The Operator can install the driver
+> and toolkit itself, in containers — but on a node prepared by
+> `gpu-node-setup.md` steps 3 and 7 they are already there. Leaving them `true`
+> makes it load a second kernel driver over the running one: the
+> `driver-daemonset` crash-loops, `nvidia-smi` on the host starts failing, and
+> running containers die with `Driver/library version mismatch`. Omit both flags
+> only on a node where you deliberately skipped those steps.
+
+Or the standalone plugin:
+
+```sh
+helm repo add nvdp https://nvidia.github.io/k8s-device-plugin
+helm repo update
+helm search repo nvdp/nvidia-device-plugin --versions | head -5
+
+helm upgrade --install nvdp nvdp/nvidia-device-plugin \
+  --namespace nvidia-device-plugin --create-namespace \
+  --version <VERSION_FROM_ABOVE> \
+  --set gfd.enabled=true \
+  --wait
+```
+
+`gfd.enabled=true` is what writes the `nvidia.com/gpu.*` node labels. Without it
+there are no labels, and the `nodeSelector` in 10.5 matches nothing — the pod
+sits `Pending` on a cluster where the GPU is demonstrably present.
+
+Watch it converge; the validator pods are noisy:
+
+```sh
+kubectl -n gpu-operator get pods -w
+```
+
+`nvidia-operator-validator` reaching `Completed`/`Running` is the verdict
+everything downstream depends on. Then re-run 10.1 — the GPU column must show a
+number.
+
+Finally, prove it end to end, through all six layers:
+
+```sh
+kubectl apply -f - <<'EOF'
+apiVersion: v1
+kind: Pod
+metadata:
+  name: cuda-vectoradd
+spec:
+  restartPolicy: OnFailure
+  nodeSelector:
+    nvidia.com/gpu.present: "true"
+  tolerations:
+    - key: nvidia.com/gpu
+      operator: Exists
+      effect: NoSchedule
+  containers:
+    - name: cuda-vectoradd
+      image: nvcr.io/nvidia/k8s/cuda-sample:vectoradd-cuda12.5.0
+      resources:
+        limits:
+          nvidia.com/gpu: 1
+EOF
+
+kubectl logs -f pod/cuda-vectoradd
+kubectl delete pod cuda-vectoradd
+```
+
+`Test PASSED` is the whole stack working. This needs a real GPU — on the fake
+capacity from 10.2 the pod schedules and then fails, because there is no device
+to open.
+
+### 10.4 Taint the node
+
+Labels let GPU work *find* the node. A taint stops everything else *landing* on
+it — otherwise the cluster's ordinary pods fill up your most expensive machine:
+
+```sh
+kubectl taint node "$NODE" nvidia.com/gpu=present:NoSchedule --overwrite
+```
+
+`NoSchedule`, not `NoExecute`: `NoExecute` evicts pods already running without
+the toleration, which on a live node means kicking off whatever was there.
+
+### 10.5 Send the app to it
+
+The chart already carries the wiring — `gpu` in `helm/notes-app/values.yaml`:
+
+```sh
+helm upgrade --install notes-app helm/notes-app --set gpu.enabled=true
+kubectl get pods -o wide          # lands on $NODE, Running
+```
+
+Three things flip together, and each one alone leaves the pod broken
+differently:
+
+| Rendered | Without it |
+|---|---|
+| `resources.limits."nvidia.com/gpu": 1` | runs on the GPU node with no GPU visible |
+| `nodeSelector: nvidia.com/gpu.present: "true"` | `Pending` — "Insufficient nvidia.com/gpu" |
+| toleration for the 10.4 taint | `Pending` — "node(s) had untolerated taint" |
+
+Break it on purpose — this is the part worth having seen before someone asks:
+
+```sh
+helm upgrade notes-app helm/notes-app --set gpu.enabled=true --set gpu.tolerations=null
+kubectl describe pod -l app.kubernetes.io/name=notes-app | grep -A5 Events
+
+helm upgrade notes-app helm/notes-app --set gpu.enabled=true --set gpu.count=99
+kubectl describe pod -l app.kubernetes.io/name=notes-app | grep -A5 Events
+```
+
+> The notes app is Flask and needs no GPU; enabling this makes it occupy one it
+> will never use. The point is that the *scheduling* wiring is real and
+> reviewable — on an actual GPU workload the values are identical and only the
+> image changes.
+
+### 10.6 Sharing one GPU — real hardware only
+
+Without this, a second pod asking for a GPU on a single-GPU node stays `Pending`
+forever, however idle the card is: one container gets one whole GPU, and `0.5`
+is rejected. Time-slicing advertises *n* replicas of each physical GPU:
+
+```sh
+kubectl apply -f - <<'EOF'
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: time-slicing-config
+  namespace: gpu-operator      # nvidia-device-plugin for the standalone plugin
+data:
+  any: |-
+    version: v1
+    flags:
+      migStrategy: none
+    sharing:
+      timeSlicing:
+        resources:
+          - name: nvidia.com/gpu
+            replicas: 4
+EOF
+
+helm upgrade gpu-operator nvidia/gpu-operator -n gpu-operator --reuse-values \
+  --set devicePlugin.config.name=time-slicing-config \
+  --set devicePlugin.config.default=any
+```
+
+**The new capacity is a lie the scheduler believes.** It is still one card with
+one pool of VRAM — four pods each allocating 20 GB on a 40 GB card will OOM, and
+the scheduler will have placed all four. Time-slicing multiplies *scheduling
+slots*, not memory. MIG is the answer when isolation actually matters, on
+A100/H100/A30 only. The GPU Operator manages it via `mig.strategy=single|mixed`
+and a `MIG_CONFIGURATION` ConfigMap, and the resource name becomes e.g.
+`nvidia.com/mig-1g.5gb`. Do not attempt it on hardware that lacks support.
+
+### 10.7 Undo
+
+```sh
+helm upgrade notes-app helm/notes-app                  # gpu.enabled back to false
+kubectl taint node "$NODE" nvidia.com/gpu-
+kubectl label node "$NODE" nvidia.com/gpu.present- nvidia.com/gpu.count-
+```
+
+The fake capacity from 10.2 needs the node object rebuilt, so
+`kind delete cluster` is the only full reset.
+
+### What this section cannot rehearse
+
+Worth being straight about rather than pretending otherwise. On a cluster with
+no GPU, the driver install, Secure Boot/MOK, the container toolkit, the plugin
+actually finding devices, and time-slicing all need real hardware. What 10.2–10.5
+*does* exercise is advertisement, selection, tolerations, resource limits and the
+failure messages — which is most of what gets asked about, because it is where
+most real mistakes are. Full troubleshooting table:
+[gpu-node-setup.md](gpu-node-setup.md) Appendix C.
+
+---
+
+## 11. Pause and resume
 
 kind nodes are ordinary Docker containers, so the cluster stops and starts like
 one. There is no `kind pause`; `docker stop` is the whole mechanism.
@@ -938,9 +1221,9 @@ Two neighbouring options:
 
 ---
 
-## 11. Teardown
+## 12. Teardown
 
-Permanent, unlike step 10:
+Permanent, unlike step 11:
 
 ```sh
 kind delete cluster --name notes-app
