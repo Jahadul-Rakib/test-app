@@ -1655,15 +1655,15 @@ controller:
   # `{{ default "" .Values.controller.jenkinsUriPrefix }}/login`.
   jenkinsUriPrefix: /jenkins
 
-  # Sized to stay up permanently, not to build fast. A 1 GB heap is the stock
-  # advice and it is what tipped this machine into swap thrash; 512 MB runs the
-  # controller comfortably because it schedules work rather than doing it --
-  # every build runs in its own pod (numExecutors: 0).
+  # 896m is a FLOOR, not a preference -- see "the agent connects but the build
+  # never starts" in troubleshooting. 512m looks like it works (UI serves, pod
+  # 1/1 Ready, plugins load) and then silently cannot launch a build agent: the
+  # kubernetes plugin's remoting handshake needs headroom the GC never gives it.
   #
   # With no Kubernetes memory limit set (see the sizing note), this line is the
   # ONLY thing bounding the controller. Real usage lands ~100-200 MB above the
-  # heap -- metaspace, thread stacks, code cache -- so budget ~700 MB for it.
-  javaOpts: "-Xms192m -Xmx512m"
+  # heap -- metaspace, thread stacks, code cache -- so budget ~1.1 GB for it.
+  javaOpts: "-Xms256m -Xmx896m"
 
   ingress:
     enabled: true
@@ -1691,6 +1691,12 @@ controller:
 agent:
   enabled: true
   namespace: jenkins
+  # REQUIRED here. Without it agents connect over raw TCP to jenkins-agent:50000,
+  # print "Connected", and never register -- the build then waits forever on
+  # "Waiting for agent to connect (n/1,000)". WebSocket tunnels remoting over the
+  # same HTTP port the UI uses. See "the agent connects but the build never
+  # starts" in troubleshooting.
+  websocket: true
 
 persistence:
   # NOT "standard" -- that class exists on kind, not here. Step 11 installed
@@ -2243,6 +2249,65 @@ helm upgrade argocd argo/argo-cd -n argocd --version 10.3.3 --reuse-values \
 
 The same reasoning applies to any component that crash-loops with `exit 0`
 after the cluster gets busy — check the probe before you touch anything else.
+
+### The agent connects, but the build never starts
+
+The most misleading failure in this document, because **both sides report
+success**. The agent's own log says it connected:
+
+```sh
+kubectl -n jenkins logs <build-pod> -c jnlp --tail=5
+```
+```
+INFO: Remote identity confirmed: 76:45:67:b3:fe:87:21:15:31:60:6e:65:75:ed:05:20
+INFO: Connected
+```
+
+The build pod is `4/4 Running`. And the controller sits there forever:
+
+```sh
+kubectl -n jenkins logs jenkins-0 -c jenkins --tail=200 | grep 'Waiting for agent'
+```
+```
+o.c.j.p.k.KubernetesLauncher#launch: Waiting for agent to connect (208/1,000): notes-app-1-...
+```
+
+`kubectl -n jenkins get pod` looks perfect, so the instinct is to blame the pod
+template. It is not the pod, and it is not memory either.
+
+**The cause is the JNLP transport.** By default agents connect over raw TCP to
+the `jenkins-agent` Service on port 50000. On this cluster that connection
+completes far enough for the agent to confirm the controller's identity and
+print `Connected`, and then never finishes registering — so the computer stays
+`offline: true` with an **empty** `offlineCauseReason`, which is the tell: the
+controller has no error to report because nothing errored.
+
+Switch agents to WebSocket, which tunnels remoting over the same HTTP port the
+UI uses and needs no 50000 path at all:
+
+```sh
+helm upgrade jenkins jenkins/jenkins -n jenkins --version 5.9.54 --reuse-values \
+  --set agent.websocket=true \
+  --set controller.jenkinsUrl="http://${INGRESS_IP}/jenkins"
+```
+
+The agent log changes from `Connecting to jenkins-agent...:50000` to:
+
+```
+INFO: WebSocket connection open
+INFO: Connected
+```
+
+and the build starts. No restart of the controller is needed — the cloud config
+reloads on its own.
+
+> **A red herring worth naming.** When this was first hit, the controller was at
+> **571 MB RSS against `-Xmx512m`**, which looks exactly like GC starvation and
+> is a very satisfying explanation. Raising the heap to 896m did not fix it —
+> the next build sat at 562 MB with plenty of headroom and hung identically.
+> Memory pressure is real on this machine and worth fixing on its own merits,
+> but it was not this. If the agent prints `Connected` and the controller still
+> waits, look at the transport before the heap.
 
 ### "Everything broke after a Mac reboot"
 
