@@ -8,7 +8,7 @@
 //
 // The build/scan/push order is deliberate and is the reason for the tarball:
 //
-//     kaniko --no-push --tarball-path   ->  trivy --input  ->  crane push
+//     kaniko --no-push --tar-path   ->  trivy --input  ->  crane push
 //
 // Kaniko's usual mode builds AND pushes in one shot, which would put an
 // unscanned image in the registry and only then let Trivy look at it. Writing a
@@ -228,11 +228,15 @@ JSON
                     sh '''#!/busybox/sh
                         set -e
 
-                        # --no-push + --tarball-path is the whole point: build
-                        # now, push only after Trivy has passed. --destination
-                        # is still required, because it is what stamps the ref
+                        # --no-push + --tar-path is the whole point: build now,
+                        # push only after Trivy has passed. --destination is
+                        # still required, because it is what stamps the ref
                         # INTO the tarball -- crane later pushes it under
                         # exactly this name.
+                        #
+                        # The flag is --tar-path. NOT --tarball-path, which
+                        # kaniko rejects by printing its entire help text and
+                        # exiting 1, with no line saying which flag was wrong.
                         #
                         # --context dir:// -- the shared workspace, already
                         # checked out by the tools container.
@@ -241,7 +245,7 @@ JSON
                             --dockerfile "$WORKSPACE/Dockerfile" \
                             --destination "$IMAGE_REPOSITORY:$IMAGE_TAG" \
                             --no-push \
-                            --tarball-path "$IMAGE_TARBALL" \
+                            --tar-path "$IMAGE_TARBALL" \
                             --single-snapshot \
                             --label "org.opencontainers.image.title=$APP_NAME" \
                             --label "org.opencontainers.image.revision=$GIT_SHA" \
