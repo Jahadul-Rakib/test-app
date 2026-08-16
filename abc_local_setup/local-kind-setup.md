@@ -5,26 +5,53 @@ Rollouts, Kyverno, **Jenkins**, credentials, and the app. Everything that ships
 a Helm chart is installed with Helm. Every step is a command you can paste; no
 files to create by hand.
 
-Three web UIs at the end, all on port 80 through the ingress controller, and
-every one of them created by its own Helm chart — no Ingress manifest is
-applied by hand anywhere in this document:
+## Architecture: one IP, path-based routing
 
-| UI | URL |
+Everything is reached through **a single MetalLB LoadBalancer IP**, with
+NGINX routing on the URL path:
+
+```
+  macOS browser
+       │
+       │  http://<METALLB-IP>/jenkins
+       │  http://<METALLB-IP>/app
+       │  http://<METALLB-IP>/argocd
+       ▼
+  MetalLB  ── assigns ONE external IP ──►  ingress-nginx Service (LoadBalancer)
+                                                │
+                                    NGINX Ingress Controller
+                                                │
+                        ┌───────────────────────┼───────────────────────┐
+                        ▼                       ▼                       ▼
+                  /jenkins → Jenkins      /app → notes-app       /argocd → Argo CD
+```
+
+> ## No DNS is required for the local setup.
+>
+> There is **nothing to add to `/etc/hosts`**, no DNS server, no hostname
+> configuration, and no per-application LoadBalancer IP. Services are reached
+> by IP and path. Every Ingress rule in this document is deliberately written
+> with **no host**, so it matches any `Host:` header.
+
+Find the IP — this one command is the only thing you need before any URL below:
+
+```sh
+kubectl -n ingress-nginx get svc ingress-nginx-controller \
+  -o jsonpath='{.status.loadBalancer.ingress[0].ip}'; echo
+```
+
+| Service | URL |
 |---|---|
-| Argo CD — **canary control lives here** | http://argocd.localtest.me |
-| Jenkins | http://jenkins.localtest.me |
-| The app | http://notes.localtest.me |
+| Jenkins | `http://<METALLB-IP>/jenkins` |
+| The app | `http://<METALLB-IP>/app` |
+| Argo CD — **canary control lives here** | `http://<METALLB-IP>/argocd` — **UI caveat, see step 8.3** |
 
 There is no separate Rollouts URL. The rollout extension renders canary steps,
 weights and the Promote/Abort buttons inside Argo CD itself. The Rollouts
 dashboard still runs — it is the API the extension proxies to — it just does not
 need its own ingress.
 
-`*.localtest.me` resolves to `127.0.0.1` publicly, so there is nothing to add to
-`/etc/hosts` — provided the browser and the cluster are on the same machine. On
-a remote Ubuntu server they are not, and step 8.2 covers that.
-
-Budget ~30 minutes, most of it image pulls.
+Budget ~35 minutes, most of it image pulls.
 
 ### macOS or Ubuntu
 
@@ -35,9 +62,8 @@ call below is shared. What differs is marked where it comes up:
 | Area | Difference | Where |
 |---|---|---|
 | Tool install | `brew` vs. release binaries | step 0.1 / 0.2 |
-| Port 80 | far likelier to be taken on a server | step 1 |
 | Shell quoting | zsh globs `[0]`, bash does not | step 3 |
-| Reaching the UIs | loopback vs. a remote host | step 8.2 |
+| MetalLB IP reachability | works natively on OrbStack; needs a check elsewhere | step 3.1 |
 
 Memory is the one prerequisite that is genuinely not the same:
 
@@ -63,6 +89,103 @@ Everything below fits in 4 GB as written; Kyverno in step 6 is the piece that
 pushes it over, so it is opt-in. At 4 GB do not add nodes or re-enable the Argo
 CD components switched off in step 5 — the first thing to fail is the API
 server, with `TLS handshake timeout`.
+
+---
+
+## Quick installation
+
+**For rebuilding an environment you already understand.** Every command here is
+explained in the full walkthrough that follows — if anything fails, or this is
+your first time, use that instead. Steps 0 (tools) and 9 (credentials) are
+**not** optional and are not repeated here: without the credentials in step 9
+Argo CD cannot clone the repo and Jenkins cannot push images.
+
+```sh
+# 0. Prerequisites: docker (OrbStack on macOS), kind, kubectl, helm -- see step 0.
+#    Run everything below from the repository root.
+
+# 1. Cluster
+kind create cluster --config /tmp/kind-notes-app.yaml     # config in step 1
+
+# 2. Helm repos
+helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx
+helm repo add argo          https://argoproj.github.io/argo-helm
+helm repo add kyverno       https://kyverno.github.io/kyverno
+helm repo add jenkins       https://charts.jenkins.io
+helm repo update
+
+# 3. Confirm the kind subnet matches k8s/metallb/metallb-config.yaml, and that
+#    container IPs are routable from macOS. Do not skip.
+docker network inspect kind --format '{{json .IPAM.Config}}'
+ping -c 2 "$(docker network inspect kind --format '{{range .Containers}}{{.IPv4Address}}{{"\n"}}{{end}}' | head -1 | cut -d/ -f1)"
+
+# 4. MetalLB
+kubectl apply -f https://raw.githubusercontent.com/metallb/metallb/v0.15.3/config/manifests/metallb-native.yaml
+kubectl -n metallb-system wait --for=condition=Available deploy/controller --timeout=300s
+kubectl -n metallb-system rollout status ds/speaker --timeout=300s
+kubectl apply -f k8s/metallb/metallb-config.yaml
+
+# 5. Ingress controller on the MetalLB IP
+helm install ingress-nginx ingress-nginx/ingress-nginx \
+  --namespace ingress-nginx --create-namespace --version 4.15.1 \
+  --set controller.service.type=LoadBalancer \
+  --set controller.watchIngressWithoutClass=true \
+  --set controller.replicaCount=1 --wait
+
+export LB_IP=$(kubectl -n ingress-nginx get svc ingress-nginx-controller \
+  -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+echo "LB_IP=$LB_IP"          # must be non-empty before continuing
+
+# 6. Argo Rollouts (before Argo CD -- the app chart renders a Rollout)
+helm install argo-rollouts argo/argo-rollouts \
+  --namespace argo-rollouts --create-namespace --version 2.41.1 \
+  --set dashboard.enabled=true --set controller.replicas=1 --wait
+
+# 7. Argo CD
+helm install argocd argo/argo-cd --namespace argocd --create-namespace \
+  --version 10.3.3 -f k8s/argocd/argocd-values.yaml --wait
+
+# 8. Jenkins
+helm install jenkins jenkins/jenkins --namespace jenkins --create-namespace \
+  --version 5.9.54 -f k8s/jenkins/jenkins-values.yaml \
+  --set controller.jenkinsUrl="http://${LB_IP}/jenkins" --wait --timeout 10m
+
+# 9. Credentials -- REQUIRED, see step 9. Then the app:
+kubectl apply -f argocd/application.yaml
+
+# 10. Verify
+kubectl get ingress -A                       # HOSTS must all be *
+curl -sS -o /dev/null -w 'jenkins %{http_code}\n' "http://$LB_IP/jenkins/login"
+curl -sS -o /dev/null -w 'app     %{http_code}\n' "http://$LB_IP/app/healthz"
+curl -sS -o /dev/null -w 'argocd  %{http_code}\n' "http://$LB_IP/argocd/api/version"
+```
+
+Optional: Kyverno (step 6) for signature enforcement, and step 10 for GPU
+support.
+
+---
+
+## Full installation
+
+Steps 0–12 below are the complete, explained procedure, in order:
+
+| | Step |
+|---|---|
+| 0 | Prerequisites and tools |
+| 1 | kind cluster creation |
+| 2 | Helm repositories |
+| 3 | **Networking — kind network, MetalLB, IP pool, verification, ingress-nginx** |
+| 4 | Argo Rollouts |
+| 5 | Argo CD (path routing) |
+| 6 | Kyverno (optional) |
+| 7 | Jenkins (path routing) |
+| 8 | Reaching the UIs |
+| 9 | Credentials |
+| 10 | GPU support (optional) |
+| 11 | Pause and resume |
+| 12 | Teardown |
+| 13 | Troubleshooting |
+| 14 | Later: moving to hostname routing |
 
 ---
 
@@ -182,19 +305,16 @@ name: notes-app
 nodes:
   - role: control-plane
     image: kindest/node:v1.33.1
-    kubeadmConfigPatches:
-      - |
-        kind: InitConfiguration
-        nodeRegistration:
-          kubeletExtraArgs:
-            node-labels: "ingress-ready=true"
-    extraPortMappings:
-      - containerPort: 80
-        hostPort: 80
-        protocol: TCP
-      - containerPort: 443
-        hostPort: 443
-        protocol: TCP
+    # NO extraPortMappings and no ingress-ready label.
+    #
+    # Both existed only to work around kind having no LoadBalancer: the ingress
+    # controller bound hostPort 80/443 on a labelled node, and kind published
+    # those to the host so http://localhost worked. MetalLB replaces that
+    # entirely -- it hands out a real routable IP, so nothing needs to bind a
+    # host port and nothing needs pinning to a specific node.
+    #
+    # Dropping them also frees host port 80, which is the usual reason cluster
+    # creation failed on a machine already running apache2 or nginx.
     extraMounts:
       # Jenkins runs `docker build`, but kind nodes use containerd and have no
       # docker daemon. Passing the host socket through lets the Jenkins pod
@@ -218,15 +338,14 @@ kubectl cluster-info --context kind-notes-app
 kubectl get nodes
 ```
 
-Two nodes: the control-plane carries ingress and publishes 80/443 to your host,
-plus one worker. Each kind node costs roughly 400 MB, so a third is the easiest
-thing to cut at 4 GB — the app's 4 replicas still spread across two.
+Two nodes. Each kind node costs roughly 400 MB, so a third is the easiest thing
+to cut at 4 GB.
 
-> **Port 80 in use?** Cluster creation fails. Stop whatever holds it, or change
-> both `hostPort: 80` and the URLs below to `8080`. On an Ubuntu server this is
-> far likelier than on a Mac — apache2 or nginx often comes pre-installed and
-> already owns the port. `sudo ss -lptn 'sport = :80'` names the process
-> (`sudo lsof -iTCP:80 -sTCP:LISTEN` on macOS).
+> **Already have a cluster from the old hostPort-based version of this guide?**
+> You do **not** need to recreate it. The `extraPortMappings` it was created
+> with are simply unused once the ingress controller stops binding host ports —
+> harmless leftovers. Skip to step 3 and switch the controller over in place.
+> Recreating the cluster would destroy the Jenkins PVC and all its job history.
 
 ---
 
@@ -242,43 +361,160 @@ helm repo update
 
 ---
 
-## 3. Ingress controller
+## 3. Networking — MetalLB and the ingress controller
+
+This is the heart of the setup. MetalLB hands out **one** external IP; NGINX
+takes it and routes on path. Do the sub-steps in order and verify each — a
+LoadBalancer that has an `EXTERNAL-IP` is not the same thing as one you can
+reach.
+
+### 3.1 Choose the address pool from the real network
+
+Do not copy an IP range blindly. Derive it from the `kind` Docker network:
+
+```sh
+docker network inspect kind --format '{{json .IPAM.Config}}'
+```
+
+```sh
+docker network inspect kind --format '{{range .Containers}}{{.Name}} {{.IPv4Address}}{{"\n"}}{{end}}'
+```
+
+On the machine this was written against those printed subnet
+`192.168.107.0/24` (gateway `.1`) with the kind nodes on `.2` and `.3`. Docker
+allocates container addresses from the **low** end of the subnet, so a pool at
+the **high** end cannot collide with a node that joins later.
+
+`k8s/metallb/metallb-config.yaml` in this repo carries that range. **Edit both
+`addresses` entries if your subnet differs** — an address outside the kind
+subnet gets assigned happily and then answers nothing, because the host has no
+route to it.
+
+### 3.2 Check that the pool will be reachable from macOS
+
+The most important check in this document, and the one most guides skip.
+
+```sh
+docker network inspect kind --format '{{range .Containers}}{{.IPv4Address}}{{"\n"}}{{end}}' | head -1
+ping -c 2 192.168.107.2        # substitute a node IP from the line above
+```
+
+- **Replies** — container IPs are routed to the host. **OrbStack does this
+  natively**, which is what makes this whole setup work on macOS. Continue.
+- **No replies** — you are almost certainly on **Docker Desktop**, whose VM does
+  not route the bridge network to macOS. MetalLB will still assign an
+  `EXTERNAL-IP`, and it will be unreachable from your browser. Switch to
+  OrbStack, or see the troubleshooting entry *"MetalLB IP assigned but
+  unreachable from macOS"* in step 13.
+
+```sh
+netstat -rn -f inet | grep 192.168.107     # a route via bridgeNNN confirms it
+```
+
+### 3.3 Install MetalLB
+
+```sh
+kubectl apply -f https://raw.githubusercontent.com/metallb/metallb/v0.15.3/config/manifests/metallb-native.yaml
+```
+
+Pin the version. The GitHub *latest release* API for this project returns a
+**Helm chart** tag (`metallb-chart-x.y.z`) whose manifest ships `:main` images —
+a floating dev tag, wrong for a reproducible setup.
+
+Wait for the controller and every speaker:
+
+```sh
+kubectl -n metallb-system wait --for=condition=Available deploy/controller --timeout=180s
+kubectl -n metallb-system rollout status ds/speaker --timeout=180s
+kubectl -n metallb-system get pods
+```
+
+All pods must be `Running` and `1/1` before continuing — the webhook that
+validates the next step lives in the controller.
+
+### 3.4 Apply the address pool
+
+```sh
+kubectl apply -f k8s/metallb/metallb-config.yaml
+```
+
+```sh
+kubectl get ipaddresspools -n metallb-system
+kubectl get l2advertisements -n metallb-system
+```
+
+The pool is L2 mode: a speaker answers ARP for the pool addresses, so the IP
+resolves to a node MAC. There is no router to peer with here, which is why this
+is not BGP mode.
+
+### 3.5 Verify MetalLB with a throwaway Service
+
+Do not continue until this passes.
+
+```sh
+kubectl create deploy metallb-test --image=registry.k8s.io/e2e-test-images/agnhost:2.53 \
+  -- /agnhost netexec --http-port=8080
+kubectl expose deploy metallb-test --type=LoadBalancer --port=80 --target-port=8080
+kubectl get svc metallb-test
+```
+
+`EXTERNAL-IP` must become an address from your pool, not `<pending>`. Then —
+the part that actually matters — reach it **from macOS**:
+
+```sh
+IP=$(kubectl get svc metallb-test -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+curl -sS -m 10 -o /dev/null -w 'HTTP %{http_code}\n' "http://${IP}/"
+curl -sS -m 10 "http://${IP}/hostname"; echo
+```
+
+`HTTP 200` and a pod name printed back is real reachability. `arp -n "$IP"`
+should show the IP resolving to a node MAC.
+
+Clean up:
+
+```sh
+kubectl delete svc metallb-test
+kubectl delete deploy metallb-test
+```
+
+### 3.6 Ingress controller, as a LoadBalancer
 
 ```sh
 helm install ingress-nginx ingress-nginx/ingress-nginx \
   --namespace ingress-nginx --create-namespace \
   --version 4.15.1 \
-  --set controller.hostPort.enabled=true \
-  --set controller.service.type=NodePort \
-  --set-string 'controller.nodeSelector.ingress-ready=true' \
-  --set 'controller.tolerations[0].key=node-role.kubernetes.io/control-plane' \
-  --set 'controller.tolerations[0].operator=Equal' \
-  --set 'controller.tolerations[0].effect=NoSchedule' \
+  --set controller.service.type=LoadBalancer \
   --set controller.watchIngressWithoutClass=true \
   --set controller.replicaCount=1 \
   --wait
 ```
 
-Two flag details that are not cosmetic. The single quotes are required on zsh
-(the macOS default) — unquoted `tolerations[0]` is read as a glob and the
-command dies with `no matches found` before helm is even reached. Ubuntu's bash
-passes an unmatched glob through untouched, so the quotes are redundant there —
-but harmless, which is why the command above is written once for both. And
-`nodeSelector` must use
-`--set-string`: with plain `--set`, helm types `true` as a boolean and the API
-server rejects the Deployment with `cannot unmarshal bool into ... nodeSelector
-of type string`.
+`service.type=LoadBalancer` is the whole point: MetalLB assigns this Service the
+shared IP, and every application reaches the browser through it.
 
-Those flags matter. The stock chart asks for a `LoadBalancer` Service, which
-never gets an external IP on kind and leaves the controller `<pending>` forever.
-Instead it binds hostPort 80/443 on the node labelled `ingress-ready=true` — the
-one whose ports kind published in step 1.
+**No `hostPort`, no `NodePort`.** The older version of this document used
+`controller.hostPort.enabled=true` plus a `NodePort` Service and an
+`ingress-ready=true` nodeSelector, because without MetalLB a `LoadBalancer`
+Service on kind stays `<pending>` forever. With MetalLB that workaround is
+obsolete — and hostPort is what tied the setup to `http://localhost` and
+hostname routing.
+
+### 3.7 Verify the ingress controller got the IP
 
 ```sh
-curl -s -o /dev/null -w '%{http_code}\n' http://localhost      # 404 = up
+kubectl get svc -n ingress-nginx
 ```
 
-`404` is success: nginx is answering and has no matching host yet.
+`ingress-nginx-controller` must show an `EXTERNAL-IP` from the pool. Save it:
+
+```sh
+export LB_IP=$(kubectl -n ingress-nginx get svc ingress-nginx-controller \
+  -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+echo "$LB_IP"
+curl -s -o /dev/null -w '%{http_code}\n' "http://$LB_IP/"      # 404 = up
+```
+
+`404` is success: nginx is answering and no rule claims `/` yet.
 
 ---
 
@@ -307,81 +543,31 @@ Argo CD UI are dead without it. It needs no ingress of its own.
 ## 5. Argo CD
 
 ```sh
-cat <<'EOF' >/tmp/argocd-values.yaml
-configs:
-  params:
-    # Plain HTTP. Otherwise the server serves a self-signed cert and every
-    # port-forward, CLI call and ingress hop needs --insecure.
-    server.insecure: true
-  cm:
-    # Poll git every 60s instead of the 180s default. GitHub cannot reach a
-    # local cluster, so webhooks are out and polling is the only trigger.
-    timeout.reconciliation: 60s
-    timeout.reconciliation.jitter: 10s
-    # Half two of the rollout extension: lets argocd-server proxy UI calls
-    # through to the Rollouts dashboard API. Without the initContainer below
-    # there is no UI to make those calls, and without this the UI has nothing
-    # to call.
-    extension.config: |
-      extensions:
-        - name: rollout
-          backend:
-            services:
-              - url: http://argo-rollouts-dashboard.argo-rollouts.svc.cluster.local:3100
-
-server:
-  replicas: 1
-
-  # The chart writes the Ingress itself -- no separate manifest to apply. It
-  # reads `server.insecure` above to pick the backend port: true -> port 80
-  # (plain HTTP, nginx terminates), false -> 443, which would need
-  # ssl-passthrough enabled on the controller. Option 2 in the Argo CD docs.
-  ingress:
-    enabled: true
-    ingressClassName: nginx
-    hostname: argocd.localtest.me      # singular `hostname` since chart 7.x;
-                                       # older docs show a `hosts:` list
-
-  # Half one: an initContainer downloads the rollout extension bundle into
-  # argocd-server, which is what actually renders canary steps, weights and the
-  # Promote/Abort buttons inside the Argo CD UI. Without it a Rollout shows as
-  # a generic resource with no controls.
-  #
-  # Keep this inside the single `server:` block -- a second top-level `server:`
-  # key silently wins and drops everything above it.
-  extensions:
-    enabled: true
-    extensionList:
-      - name: rollout-extension
-        env:
-          - name: EXTENSION_URL
-            value: https://github.com/argoproj-labs/rollout-extension/releases/download/v0.4.0/extension.tar
-
-# HA defaults will not schedule on kind.
-redis-ha:
-  enabled: false
-controller:
-  replicas: 1
-repoServer:
-  replicas: 1
-
-# Not used by this setup, ~100-150 MB each. Turning them off is part of what
-# keeps Argo CD inside a 4 GB budget. (applicationSet has no top-level
-# `enabled` key in this chart, so it stays -- it is small.)
-dex:
-  enabled: false
-notifications:
-  enabled: false
-EOF
-
 helm install argocd argo/argo-cd \
   --namespace argocd --create-namespace \
   --version 10.3.3 \
-  -f /tmp/argocd-values.yaml \
+  -f k8s/argocd/argocd-values.yaml \
   --wait
 ```
 
-The UI is on http://argocd.localtest.me as soon as this finishes. Credentials
+The values live in **`k8s/argocd/argocd-values.yaml`** in this repo, not a
+`/tmp` heredoc, so the setup is reproducible from a clone. Read it — the
+comments explain each setting. The two that matter for path routing:
+
+- `configs.params."server.rootpath": /argocd` — argocd-server strips `/argocd`
+  from incoming paths and serves the subtree itself, so **no rewrite annotation
+  is used**.
+- `global.domain: ""` — required. Setting `server.ingress.hostname: ""` alone is
+  not enough: the chart falls back to `global.domain`, whose default is
+  `argocd.example.com`, and you get a hostname-bound rule that answers nothing
+  on an IP. Blanking both is what produces `HOSTS *`:
+
+```sh
+kubectl get ingress -n argocd        # HOSTS must show *, not a hostname
+```
+
+Argo CD is at `http://<METALLB-IP>/argocd` as soon as this finishes, with the
+**UI caveat in step 8.3**. Credentials are in step 8.1.
 are in step 8.1.
 
 ---
@@ -542,137 +728,112 @@ anonymous pull above work. Nothing needs to be flipped in the UI.
 </details>
 
 ```sh
-cat <<'EOF' >/tmp/jenkins-values.yaml
-controller:
-  image:
-    # Pulled from Docker Hub. Public, so no imagePullSecret -- contrast with
-    # the app's own image in step 9.2. Registry and repository are split here
-    # because the chart joins them itself; an empty registry renders a leading
-    # slash and fails outright.
-    registry: docker.io
-    repository: jahadulrakib/jenkins-devops-kubernetes
-    tag: lts-jdk21
-    # The tag is immutable in practice, so pull once per node and stop asking.
-    pullPolicy: IfNotPresent
-
-  # The chart defaults to 0, which leaves `agent any` in the Jenkinsfile
-  # queued forever. Run builds on the controller instead of provisioning
-  # dynamic agents -- simpler locally, and the tools are in this image.
-  numExecutors: 2
-
-  # Root so the container can use the mounted docker socket without fighting
-  # group ownership. Local-only shortcut.
-  #
-  # BOTH are required: the chart sets containerSecurityContext.runAsUser to
-  # 1000, which overrides the pod-level runAsUser. Set only the pod-level one
-  # and the container still starts as uid 1000, with "permission denied" on
-  # the socket.
-  runAsUser: 0
-  fsGroup: 0
-  containerSecurityContext:
-    runAsUser: 0
-    runAsGroup: 0
-    readOnlyRootFilesystem: false
-    allowPrivilegeEscalation: false
-
-  jenkinsUrl: http://jenkins.localtest.me
-  ingress:
-    enabled: true
-    ingressClassName: nginx
-    hostName: jenkins.localtest.me
-
-  # `installPlugins` is left unset ON PURPOSE. Setting it REPLACES the chart's
-  # four defaults -- kubernetes, workflow-aggregator, git,
-  # configuration-as-code -- rather than adding to them, and those defaults
-  # ship pinned to versions tested against this chart release.
-  # `additionalPlugins` layers on top and keeps the pins.
-  #
-  # There is no setup wizard here (the chart disables it), so nothing arrives
-  # by itself: this list plus the four defaults is exactly what gets installed.
-  additionalPlugins:
-    # REQUIRED. Backs options { timestamps() }. Without it the pipeline dies
-    # with `Invalid option type "timestamps"` before any stage runs.
-    - timestamper:latest
-
-    # withCredentials() in the Push, Sign and Update GitOps stages. It already
-    # arrives transitively via workflow-aggregator -> pipeline-model-definition,
-    # but it is load-bearing enough here to name rather than inherit.
-    - credentials-binding:latest
-
-    # Not used by the current Jenkinsfile -- it shells out to `docker` and
-    # never calls the docker.* DSL or readYaml/readJSON. Kept because both are
-    # what you reach for first when editing the pipeline.
-    - docker-workflow:latest
-    - pipeline-utility-steps:latest
-
-    # Suggested-set essentials worth having on any Jenkins:
-    - ws-cleanup:latest              # cleanWs(); the PVC is only 8Gi
-    - github:latest                  # commit/branch links back to the repo
-    - antisamy-markup-formatter:latest   # stops raw HTML in descriptions
-    - build-timeout:latest           # wall-clock kill for wedged builds
-
-# No dynamic Kubernetes agents. The chart ships a default pod template, and
-# `agent any` in the Jenkinsfile will happily schedule onto it -- a bare
-# inbound-agent image with no docker, helm, trivy or cosign, so the build dies
-# with `docker: not found`. Turning this off leaves the controller as the only
-# executor, which is where the tooling lives.
-agent:
-  enabled: false
-
-persistence:
-  storageClass: standard
-  size: 8Gi
-  # Host docker socket, passed through by the kind extraMount in step 1.
-  volumes:
-    - name: docker-sock
-      hostPath:
-        path: /var/run/docker.sock
-  mounts:
-    - name: docker-sock
-      mountPath: /var/run/docker.sock
-EOF
+export LB_IP=$(kubectl -n ingress-nginx get svc ingress-nginx-controller \
+  -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
 
 helm install jenkins jenkins/jenkins \
   --namespace jenkins --create-namespace \
   --version 5.9.54 \
-  -f /tmp/jenkins-values.yaml \
+  -f k8s/jenkins/jenkins-values.yaml \
+  --set controller.jenkinsUrl="http://${LB_IP}/jenkins" \
   --wait --timeout 10m
 ```
+
+The values live in **`k8s/jenkins/jenkins-values.yaml`** in this repo. Only
+`jenkinsUrl` is passed on the command line, because it needs the live IP —
+everything else is in the file, with comments.
+
+### 7.1 Why Jenkins needs more than an Ingress path
+
+Pointing a `/jenkins` path at the Jenkins Service is **not** enough. Jenkins
+generates absolute URLs for its own assets, redirects and form targets. Serve it
+under a prefix without telling it, and you get a page that renders once and then
+404s every CSS file, every login POST and every link.
+
+The fix is one value:
+
+```yaml
+controller:
+  jenkinsUriPrefix: /jenkins
+```
+
+It appends `--prefix=/jenkins` to the Jenkins JVM, so **Jenkins itself serves
+the subtree** and stamps the prefix onto everything it emits.
+
+Two consequences worth understanding, because they are what make this work:
+
+- **No `rewrite-target` annotation.** The backend genuinely expects
+  `/jenkins/...`. Stripping the prefix would leave Jenkins listening on `/` while
+  its own HTML pointed at `/jenkins/*` — broken in the least obvious way.
+- **The probes follow automatically.** The chart templates them as
+  `{{ default "" .Values.controller.jenkinsUriPrefix }}/login`, so they move to
+  `/jenkins/login` instead of 404ing on `/login` and CrashLoopBackOff-ing the
+  pod. This is the single most common failure when bolting a context path onto a
+  chart that does not support one.
+
+The ingress annotations in the values file cover the rest: `proxy-body-size: 50m`
+so plugin uploads do not fail with 413, and hour-long read/send timeouts so
+long-poll and CLI-over-HTTP connections are not cut at nginx's 60s default.
+
+### 7.2 Verify Jenkins under the path
+
+```sh
+curl -sS -o /dev/null -w 'jenkins       %{http_code}  -> %{redirect_url}\n' "http://$LB_IP/jenkins"
+curl -sS -o /dev/null -w 'jenkins/login %{http_code}\n'                     "http://$LB_IP/jenkins/login"
+```
+
+Expect `301` to `http://<IP>/jenkins/` and `200` on the login page. A `403` on
+`/jenkins/` is **correct** — it is Jenkins requiring auth, and it redirects to
+`/jenkins/login?from=%2Fjenkins%2F`, prefix intact.
+
+Confirm the assets that break under a bad prefix setup actually load:
+
+```sh
+curl -sSL "http://$LB_IP/jenkins/login" | grep -oE '(href|src)="/jenkins/[^"]*"' | head -3
+```
+
+Every generated URL must start with `/jenkins/`. If they start with `/static/`
+instead, `jenkinsUriPrefix` did not take effect.
 
 ---
 
 ## 8. Reaching the UIs
 
-**Check Ingresses:**
+Every URL is `http://<METALLB-IP>/<path>`. **No DNS, no `/etc/hosts`.**
 
 ```sh
+export LB_IP=$(kubectl -n ingress-nginx get svc ingress-nginx-controller \
+  -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+echo "$LB_IP"
 kubectl get ingress -A
 ```
+
+Every row must show `HOSTS` = `*`. A hostname there means that release is still
+host-bound and will not answer on the IP.
+
+```sh
+curl -sS -o /dev/null -w 'jenkins  %{http_code}\n' "http://$LB_IP/jenkins/login"
+curl -sS -o /dev/null -w 'app      %{http_code}\n' "http://$LB_IP/app/healthz"
+curl -sS -o /dev/null -w 'argocd   %{http_code}\n' "http://$LB_IP/argocd/api/version"
+```
+
+Then open them in a browser on macOS:
+
+| Service | URL |
+|---|---|
+| Jenkins | `http://<LB_IP>/jenkins` |
+| The app | `http://<LB_IP>/app` |
+| Argo CD | `http://<LB_IP>/argocd` — see 8.3 |
 
 ### 8.1 Logging in
 
 Both usernames are `admin`; both passwords are generated at install time and
-kept in a Secret. Print them:
+kept in a Secret:
 
 ```sh
-# Argo CD -- http://argocd.localtest.me
-echo "user: admin"
-kubectl -n argocd get secret argocd-initial-admin-secret \
-  -o jsonpath='{.data.password}' | base64 -d; echo
-
-# Jenkins -- http://jenkins.localtest.me
-kubectl -n jenkins get secret jenkins \
-  -o jsonpath='{.data.jenkins-admin-user}' | base64 -d; echo
-kubectl -n jenkins get secret jenkins \
-  -o jsonpath='{.data.jenkins-admin-password}' | base64 -d; echo
-```
-
-Or both at once:
-
-```sh
-printf 'Argo CD   http://argocd.localtest.me\n  user: admin\n  pass: %s\n' \
+printf 'Argo CD   http://%s/argocd\n  user: admin\n  pass: %s\n' "$LB_IP" \
   "$(kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath='{.data.password}' | base64 -d)"
-printf 'Jenkins   http://jenkins.localtest.me\n  user: %s\n  pass: %s\n' \
+printf 'Jenkins   http://%s/jenkins\n  user: %s\n  pass: %s\n' "$LB_IP" \
   "$(kubectl -n jenkins get secret jenkins -o jsonpath='{.data.jenkins-admin-user}' | base64 -d)" \
   "$(kubectl -n jenkins get secret jenkins -o jsonpath='{.data.jenkins-admin-password}' | base64 -d)"
 ```
@@ -682,7 +843,7 @@ the field without it gives you gibberish that will not log you in.
 
 Argo CD's username is always `admin` and is not stored in the Secret; only the
 password is. After logging in, change it under **User Info → Update Password**,
-then delete the bootstrap Secret, which Argo CD does not need again:
+then delete the bootstrap Secret:
 
 ```sh
 kubectl -n argocd delete secret argocd-initial-admin-secret
@@ -690,60 +851,57 @@ kubectl -n argocd delete secret argocd-initial-admin-secret
 
 Jenkins keeps its Secret in use, so leave that one alone.
 
-### 8.2 Reaching a remote Ubuntu server
+### 8.2 Reaching it from another machine
 
-Skip this on a laptop, macOS or Ubuntu, where the browser and the cluster share
-a machine.
-
-The hostnames above work because `*.localtest.me` resolves to `127.0.0.1`. On a
-headless server that is the *server's* loopback, so the `curl` checks pass over
-SSH while your laptop's browser gets nothing. The ingress is fine; the name just
-points at the wrong machine.
-
-Fix it on the laptop, not on the server — one line, and every URL in this
-document keeps working unchanged:
+Nothing to configure on the client — there are no hostnames to resolve. If the
+cluster runs on a different machine than your browser, the only requirement is
+an IP route to the MetalLB pool. On a remote server that usually means an SSH
+tunnel, since the pool lives on a Docker bridge network:
 
 ```sh
-# on your LAPTOP, with the server's IP
-echo "203.0.113.10  argocd.localtest.me jenkins.localtest.me notes.localtest.me" \
-  | sudo tee -a /etc/hosts
+ssh -L 8080:<METALLB-IP>:80 user@server -N
+# then browse http://localhost:8080/jenkins
 ```
 
-A local `/etc/hosts` entry beats public DNS, so this overrides the `127.0.0.1`
-answer for those three names only. `Host:` still arrives as
-`argocd.localtest.me`, which is what nginx routes on — anything that rewrites
-the Host header, a plain `http://<server-ip>` included, lands on the default
-backend and 404s.
+Path routing survives this unchanged, which host-based routing would not: there
+is no `Host:` header to preserve.
 
-Two alternatives:
+> Everything here is HTTP with no TLS, and step 5 turns TLS off inside the
+> cluster on purpose. Do not expose it on a public IP.
 
-- **SSH tunnel**, if you cannot edit `/etc/hosts` or the server is firewalled.
-  Port 80 locally needs root, and the hostnames still have to resolve to
-  `127.0.0.1`, which `localtest.me` already does:
+### 8.3 Argo CD UI — known limitation
 
-  ```sh
-  sudo ssh -L 80:localhost:80 user@203.0.113.10 -N
-  ```
-
-- **`sslip.io`**, to skip client-side config entirely — `argocd.203.0.113.10.sslip.io`
-  resolves to that IP for everyone. It means changing the hostname in three
-  places (`server.ingress.hostname` in step 5, `controller.ingress.hostName` and
-  `jenkinsUrl` in step 7, `ingress.host` in `helm/notes-app/values.yaml`) and
-  depending on a public resolver.
-
-Whichever you pick, open port 80 if a firewall is running — a cloud provider's
-security group counts as one too:
+The Argo CD **API** works under `/argocd`:
 
 ```sh
-sudo ufw allow 80/tcp        # only if `sudo ufw status` says active
+curl -sS "http://$LB_IP/argocd/api/version"      # {"Version":"v3.5.1"}
 ```
 
-> Everything here is HTTP with no auth in front of it, and step 5 turns TLS off
-> inside the cluster on purpose. Do not expose that on a public IP. Bind the
-> server to a private network, or use the SSH tunnel, which keeps the whole
-> stack on loopback.
+The **web UI does not render** under a path prefix on Argo CD **v3.5.1**. It
+serves an unrewritten `<base href="/">` regardless of
+`ARGOCD_SERVER_BASEHREF`, so the UI's relative asset URLs resolve to `/main.js`
+instead of `/argocd/main.js` and 404 — a blank white page.
 
----
+Verify it yourself rather than taking this on trust:
+
+```sh
+curl -sS "http://$LB_IP/argocd/" | grep -o '<base href="[^"]*"'
+```
+
+If that prints `<base href="/argocd/">`, the upstream bug is fixed and the UI
+works — delete this note. While it prints `<base href="/">`, use a port-forward
+for the UI. This still needs no DNS:
+
+```sh
+kubectl -n argocd port-forward svc/argocd-server 8081:80
+# browse http://localhost:8081
+```
+
+Two rejected alternatives, for the record: an nginx `sub_filter` would rewrite
+the tag, but ingress-nginx refuses `configuration-snippet` unless the controller
+is set to accept `Critical`-risk annotations cluster-wide — too much loosening
+for one UI. Giving Argo CD its own LoadBalancer IP would also work, but breaks
+the one-IP rule this architecture is built on.
 
 ## 9. Credentials
 
@@ -785,7 +943,7 @@ is the same write-scoped one Jenkins uses, which is fine for a demo but means a
 single revoke breaks both.
 
 Re-running rotates the token in place. Check it in the UI: **Settings →
-Repositories** at <http://argocd.localtest.me> — `CONNECTION STATUS` must read
+Repositories** at `http://<LB_IP>/argocd` — `CONNECTION STATUS` must read
 `Successful`. `Failed` almost always means the `url` above does not match
 `repoURL`.
 
@@ -1234,3 +1392,359 @@ The Jenkins image is pulled from Docker Hub rather than built here, so there is
 nothing local to `docker rmi` — it is just another entry in your image cache.
 
 Everything lives in the cluster, so deleting it removes the lot.
+---
+
+## 13. Troubleshooting
+
+Symptom → diagnose → cause → fix. Every command is copy/paste.
+
+```sh
+export LB_IP=$(kubectl -n ingress-nginx get svc ingress-nginx-controller \
+  -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+```
+
+### 1. MetalLB controller not Ready
+
+```sh
+kubectl -n metallb-system get pods
+kubectl -n metallb-system logs deploy/controller --tail=50
+kubectl -n metallb-system describe deploy controller | sed -n '/Events:/,$p'
+```
+
+Usually the image is still pulling, or the webhook cert Secret has not been
+created yet. It is also the pod that gets starved first on a loaded machine —
+see item 17. Wait it out:
+
+```sh
+kubectl -n metallb-system wait --for=condition=Available deploy/controller --timeout=300s
+```
+
+### 2. MetalLB speaker not Ready
+
+```sh
+kubectl -n metallb-system get ds speaker
+kubectl -n metallb-system logs ds/speaker --tail=50
+```
+
+Speakers are a DaemonSet and use **host networking**. If one node's speaker is
+down, addresses that would be announced from that node go dark while the Service
+still shows an `EXTERNAL-IP`. A speaker stuck `Pending` usually means a port
+conflict on the host network (7946/tcp+udp for memberlist):
+
+```sh
+kubectl -n metallb-system describe pod -l component=speaker | grep -A5 Events
+```
+
+### 3. LoadBalancer EXTERNAL-IP stays `<pending>`
+
+```sh
+kubectl get svc -A | grep LoadBalancer
+kubectl get ipaddresspools -n metallb-system
+kubectl -n metallb-system logs deploy/controller --tail=30 | grep -i 'no available ips\|pool'
+kubectl describe svc <name> | sed -n '/Events:/,$p'
+```
+
+Causes, in order of likelihood:
+
+- **No IPAddressPool applied** — `kubectl apply -f k8s/metallb/metallb-config.yaml`.
+- **Pool exhausted.** The pool is 51 addresses; each LoadBalancer Service takes
+  one. This architecture should only ever use **one**. Check for strays:
+  `kubectl get svc -A | grep LoadBalancer`.
+- **`autoAssign: false`** on the pool while the Service does not name it.
+
+### 4. IP address conflict
+
+Symptom: the IP works intermittently, or reaches the wrong thing entirely.
+
+```sh
+arp -n "$LB_IP"                       # which MAC claims it?
+ping -c 2 "$LB_IP"
+docker network inspect kind --format '{{range .Containers}}{{.Name}} {{.IPv4Address}}{{"\n"}}{{end}}'
+```
+
+Cause: the pool overlaps addresses Docker hands out to containers, so both a
+container and MetalLB claim the address and ARP resolves to whichever answered
+last. Fix: move the pool to the **high end** of the subnet, above anything
+Docker will allocate, and re-apply. Verify no container already holds an address
+in the pool range using the `docker network inspect` output above.
+
+### 5. MetalLB IP assigned but unreachable from macOS
+
+The failure this whole design has to get right, and the one that is invisible
+from inside the cluster.
+
+```sh
+kubectl get svc -n ingress-nginx          # EXTERNAL-IP present?
+ping -c 2 "$LB_IP"                        # from macOS
+netstat -rn -f inet | grep 192.168        # is there a route?
+kubectl -n metallb-system logs ds/speaker --tail=20 | grep -i announc
+```
+
+If the speaker logs show it announcing the address but macOS cannot ping it,
+**the container network is not routed to the host**. That is a property of your
+Docker runtime, not of MetalLB:
+
+- **OrbStack** routes container IPs to macOS natively. This works.
+- **Docker Desktop** does not route the bridge network to the host. The IP will
+  be assigned and permanently unreachable. Options: switch to OrbStack, or fall
+  back to `kubectl port-forward` for each service (which defeats the one-IP
+  design), or run the browser inside the VM.
+
+Never conclude MetalLB works because `kubectl get svc` shows an `EXTERNAL-IP`.
+Curl it from the host.
+
+### 6. kind Docker network problem
+
+```sh
+docker network inspect kind --format '{{json .IPAM.Config}}'
+docker network ls | grep kind
+docker ps --filter name=notes-app
+```
+
+If the subnet is not what `k8s/metallb/metallb-config.yaml` assumes, the pool is
+outside the network and nothing routes. Recreating the kind cluster can allocate
+a **different** subnet — always re-check this after `kind delete`/`create`, and
+update the pool file to match.
+
+### 7. ingress-nginx not receiving an EXTERNAL-IP
+
+```sh
+kubectl -n ingress-nginx get svc ingress-nginx-controller -o wide
+kubectl -n ingress-nginx get svc ingress-nginx-controller -o jsonpath='{.spec.type}'; echo
+```
+
+If `.spec.type` is `NodePort`, the switch never happened:
+
+```sh
+helm upgrade ingress-nginx ingress-nginx/ingress-nginx -n ingress-nginx \
+  --version 4.15.1 --reuse-values \
+  --set controller.service.type=LoadBalancer \
+  --set controller.hostPort.enabled=false --wait
+```
+
+Confirm hostPort is really gone, or the controller keeps binding node ports:
+
+```sh
+kubectl -n ingress-nginx get deploy ingress-nginx-controller \
+  -o jsonpath='{.spec.template.spec.containers[0].ports}' | tr ',' '\n' | grep -i hostport
+```
+
+No output is correct.
+
+### 8. Ingress returns 404
+
+```sh
+kubectl get ingress -A
+curl -sS -o /dev/null -w '%{http_code}\n' "http://$LB_IP/"
+kubectl -n ingress-nginx logs deploy/ingress-nginx-controller --tail=30
+```
+
+`404` on `/` is **expected** — no rule claims the bare root.
+
+`404` on a path that should work means no rule matched:
+
+- **`HOSTS` is not `*`.** A host-bound rule never matches an IP request. This is
+  the single most common cause after migrating from hostname routing. Fix the
+  release's values so the hostname is empty (Argo CD additionally needs
+  `global.domain: ""`).
+- **Wrong `ingressClassName`** — must be `nginx`.
+- The controller has not reloaded yet. It takes a few seconds; re-curl.
+
+### 9. Jenkins returns 404 under /jenkins
+
+```sh
+kubectl -n jenkins get ingress jenkins -o jsonpath='{.spec.rules[0]}'; echo
+kubectl -n jenkins get cm jenkins -o yaml | grep -i prefix
+kubectl -n jenkins exec svc/jenkins -c jenkins -- printenv JENKINS_OPTS 2>/dev/null
+```
+
+Cause: `controller.jenkinsUriPrefix` is unset while the Ingress path is
+`/jenkins`, so nginx forwards `/jenkins/...` and Jenkins — listening on `/` —
+has no such route. Fix by setting the prefix (step 7), **not** by adding a
+rewrite.
+
+### 10. Jenkins redirects to the wrong URL
+
+Symptom: logging in bounces you to `http://<IP>/login` or to an old hostname.
+
+```sh
+curl -sS -o /dev/null -w '%{http_code} -> %{redirect_url}\n' "http://$LB_IP/jenkins"
+kubectl -n jenkins get cm jenkins -o yaml | grep -i jenkinsurl
+```
+
+Cause: `controller.jenkinsUrl` still points at the old hostname. Jenkins uses it
+to build absolute redirects. Fix:
+
+```sh
+helm upgrade jenkins jenkins/jenkins -n jenkins --version 5.9.54 \
+  -f k8s/jenkins/jenkins-values.yaml \
+  --set controller.jenkinsUrl="http://${LB_IP}/jenkins" --wait
+```
+
+Note the IP changes if the pool changes — re-run this after any pool edit.
+
+### 11. Jenkins CSS/JS doesn't load
+
+Symptom: unstyled HTML, browser console full of 404s.
+
+```sh
+curl -sSL "http://$LB_IP/jenkins/login" | grep -oE '(href|src)="[^"]*"' | head -5
+```
+
+Every URL must begin with `/jenkins/`. If they begin with `/static/`, Jenkins
+does not know its prefix — `jenkinsUriPrefix` is unset or did not apply.
+
+If the URLs are correct but still 404, you have added a `rewrite-target`
+annotation that strips the prefix before Jenkins sees it. Remove it: Jenkins
+wants the prefix left on.
+
+```sh
+curl -sS -o /dev/null -w '%{http_code} %{content_type}\n' \
+  "http://$LB_IP/jenkins/static/$(curl -sSL "http://$LB_IP/jenkins/login" | grep -oE 'static/[a-f0-9]+' | head -1 | cut -d/ -f2)/jsbundles/simple-page.css"
+```
+
+### 12. Application doesn't work under a path prefix
+
+The app is the mirror image of Jenkins, and the distinction is the important
+part of this whole document:
+
+| | Jenkins | notes-app |
+|---|---|---|
+| Backend expects | `/jenkins/...` | `/app/...` |
+| Mechanism | `jenkinsUriPrefix` | `SCRIPT_NAME` env |
+| Rewrite | **no** | **no** |
+
+```sh
+kubectl -n default get ingress -o jsonpath='{.items[0].spec.rules[0].http.paths[0].path}'; echo
+kubectl -n default exec deploy/... -- printenv SCRIPT_NAME     # or use a pod name
+curl -sS "http://$LB_IP/app/" | grep -oE 'action="[^"]*"'
+```
+
+`action="/app/add"` is correct. `action="/add"` means `SCRIPT_NAME` is not set —
+the page renders, then every Add and Delete 404s.
+
+### 13. NGINX rewrite problems
+
+Do **not** apply `rewrite-target` reflexively. Decide per backend:
+
+- Backend serves the prefix itself (Jenkins, Argo CD, gunicorn+`SCRIPT_NAME`)
+  → **no rewrite**, `pathType: Prefix`.
+- Backend serves at `/` and cannot be told otherwise → rewrite with a capture
+  group, and `pathType: ImplementationSpecific` because the path is a regex:
+
+```yaml
+annotations:
+  nginx.ingress.kubernetes.io/rewrite-target: /$2
+  nginx.ingress.kubernetes.io/use-regex: "true"
+spec:
+  rules:
+    - http:
+        paths:
+          - path: /foo(/|$)(.*)
+            pathType: ImplementationSpecific
+```
+
+A rewrite that strips the prefix from a backend that wanted it produces a page
+that renders once and then 404s everything — the hardest variant to diagnose,
+because the first request looks fine.
+
+### 14. Jenkins startup/probe problems
+
+```sh
+kubectl -n jenkins get pods
+kubectl -n jenkins describe pod jenkins-0 | sed -n '/Events:/,$p' | tail -15
+kubectl -n jenkins logs jenkins-0 -c jenkins --tail=50
+```
+
+Under a context path the probes must move with it. The Jenkins chart handles
+this automatically — it templates them as
+`{{ default "" .Values.controller.jenkinsUriPrefix }}/login` — so probes follow
+`jenkinsUriPrefix` with no extra work. If you hand-write probes anywhere, they
+must carry the prefix, or kubelet gets a 404, marks the container unhealthy and
+restarts it forever while the app is actually fine.
+
+```sh
+kubectl -n jenkins get statefulset jenkins \
+  -o jsonpath='{.spec.template.spec.containers[0].livenessProbe.httpGet.path}'; echo
+```
+
+Must print `/jenkins/login`.
+
+### 15. Jenkins init container CrashLoopBackOff
+
+```sh
+kubectl -n jenkins get pod jenkins-0 -o jsonpath='{.status.initContainerStatuses[*].name}'; echo
+kubectl -n jenkins logs jenkins-0 -c init --tail=50
+```
+
+The `init` container installs plugins and needs egress to
+`updates.jenkins.io`. With no internet it fails and the pod never starts. It
+also fails if a plugin in `additionalPlugins` does not exist for the Jenkins
+version. Check the log for the exact plugin name, and remember
+`installPlugins` **replaces** the chart's pinned defaults while
+`additionalPlugins` adds to them.
+
+### 16. PVC / data problems
+
+```sh
+kubectl -n jenkins get pvc
+kubectl -n jenkins get pv
+kubectl get storageclass
+```
+
+The Jenkins PVC must stay `Bound` to the **same** volume across upgrades —
+that is where job history and credentials live. Record it before any upgrade:
+
+```sh
+kubectl -n jenkins get pvc jenkins -o jsonpath='{.spec.volumeName}'; echo
+```
+
+`helm upgrade` never touches it. `helm uninstall` may, and
+`kind delete cluster` destroys it along with everything else. A PVC stuck
+`Pending` means no default StorageClass — on kind that is `standard`.
+
+### 17. Pods crash-looping right after a `git push`
+
+Not a networking problem, and easy to misread as one.
+
+```sh
+docker exec notes-app-worker uptime
+kubectl -n argocd get pods
+kubectl get events -A --sort-by=.lastTimestamp | tail -20
+```
+
+A push triggers a Jenkins build: `docker build` plus a Trivy scan will drive the
+load average well above the VM's CPU count. Probes with `timeoutSeconds: 1` —
+which is the default, and what `argocd-repo-server` uses — start timing out, and
+kubelet restarts healthy processes. The give-away is `exitCode: 143` (SIGTERM)
+with `reason: Error` and a container lifetime that exactly matches
+`initialDelaySeconds + periodSeconds × failureThreshold`.
+
+It resolves itself when the build finishes. If it happens constantly, give the
+VM more CPU or stop pushing while testing.
+
+---
+
+## 14. Later: moving to hostname routing
+
+Nothing in this architecture has to change to adopt DNS later. MetalLB and
+ingress-nginx stay exactly as they are; only the Ingress rules gain a host.
+
+When you have real DNS pointing `jenkins.example.com`, `app.example.com` and
+`argocd.example.com` at the LoadBalancer IP:
+
+| Release | Change |
+|---|---|
+| notes-app | `ingress.host: app.example.com`, `ingress.path: /` |
+| Jenkins | `controller.ingress.hostName: jenkins.example.com`, `path: /`, drop `jenkinsUriPrefix`, set `jenkinsUrl` to the hostname |
+| Argo CD | `global.domain: argocd.example.com`, drop `server.rootpath` / `server.basehref`, `server.ingress.path: /` |
+
+The chart in `helm/notes-app` already supports this: `ingress.host` is an
+optional value, and setting it adds a `host:` to the rule.
+
+Two things get simpler at that point: each app is back at `/`, so no prefix
+handling is needed anywhere, and the Argo CD UI limitation in step 8.3
+disappears, because `<base href="/">` is then correct.
+
+**Do not do this for local development.** It reintroduces the DNS dependency
+this setup exists to avoid.

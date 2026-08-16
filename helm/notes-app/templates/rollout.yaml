@@ -94,14 +94,24 @@ spec:
               mountPath: {{ $cfg.mountPath | default "/etc/config" }}
               readOnly: true
           {{- end }}
+          {{- /* Probe paths carry the SCRIPT_NAME prefix.
+                 kubelet probes the container directly, bypassing the Ingress,
+                 so it is the one caller that does NOT get the prefix added for
+                 it. gunicorn >=22 rejects any request whose path does not start
+                 with SCRIPT_NAME -- "Request path '/healthz' does not start
+                 with SCRIPT_NAME '/app'" -- returning 500, which fails the
+                 probes and CrashLoopBackOffs the pod.
+                 Derived from the same value the app reads, so the two cannot
+                 drift. Empty SCRIPT_NAME leaves this as plain /healthz. */}}
+          {{- $prefix := (.Values.config).env | default dict | dig "SCRIPT_NAME" "" }}
           livenessProbe:
             httpGet:
-              path: /healthz
+              path: {{ $prefix }}/healthz
               port: http
             initialDelaySeconds: 5
           readinessProbe:
             httpGet:
-              path: /healthz
+              path: {{ $prefix }}/healthz
               port: http
             initialDelaySeconds: 3
           resources:

@@ -60,6 +60,29 @@ Jenkins writes to the repo that Jenkins watches, which would trigger Jenkins
 forever. The write-back commit is stamped `[ci skip]`, and every stage carries
 `when { not { changelog "${CI_SKIP_PATTERN}" } }`, so that build does nothing.
 
+## Local access: one IP, path-based routing
+
+No DNS and no `/etc/hosts` entry are required. MetalLB assigns a single
+LoadBalancer IP to ingress-nginx, which routes on path:
+
+```
+  browser ──► http://<METALLB-IP>/jenkins ──┐
+              http://<METALLB-IP>/app       ├─► MetalLB ─► ingress-nginx ─┬─► Jenkins
+              http://<METALLB-IP>/argocd  ──┘      (one IP)               ├─► notes-app
+                                                                         └─► Argo CD
+```
+
+```sh
+kubectl -n ingress-nginx get svc ingress-nginx-controller \
+  -o jsonpath='{.status.loadBalancer.ingress[0].ip}'; echo
+```
+
+Each backend handles its prefix differently, and the distinction matters:
+Jenkins serves `/jenkins` itself via `jenkinsUriPrefix`; the app serves `/app`
+via gunicorn's `SCRIPT_NAME`. **Neither uses an nginx rewrite** — both want the
+prefix left on. Details and the full setup are in
+`abc_local_setup/local-kind-setup.md` step 3 (MetalLB) and steps 7–8.
+
 ## Repository layout
 
 | Path | Purpose |
@@ -68,6 +91,8 @@ forever. The write-back commit is stamped `[ci skip]`, and every stage carries
 | `Dockerfile` | Runtime image |
 | `Jenkinsfile` | The CI pipeline |
 | `helm/notes-app/` | The chart Argo CD renders (a Rollout, not a Deployment) |
+| `k8s/metallb/` | MetalLB IPAddressPool + L2Advertisement |
+| `k8s/jenkins/`, `k8s/argocd/` | Helm values for the path-routed installs |
 | `argocd/application.yaml` | Tells Argo CD what to watch |
 | `abc_local_setup/cosign/cosign.*` | Signing keypair (see the note in the setup doc) |
 | `abc_local_setup/local-kind-setup.md` | **Full setup, end to end** — cluster, addons, credentials |

@@ -42,26 +42,28 @@ ingress:
 
   # Reached at http://<METALLB-IP>/app -- no DNS, no /etc/hosts.
   #
-  # The regex is the rewrite pair: group 2 captures everything after /app, and
-  # rewrite-target below replaces the whole match with it. So /app/add reaches
-  # the container as /add.
+  # NO rewrite annotation, deliberately. The instinct with a path prefix is to
+  # strip it before the backend sees it, and for this stack that is wrong:
+  # gunicorn >= 22 REJECTS any request whose path does not start with
+  # SCRIPT_NAME, with
+  #   "Request path '/healthz' does not start with SCRIPT_NAME '/app'"
+  # and a 500. Stripping /app therefore breaks every request rather than
+  # fixing it.
   #
-  # ImplementationSpecific, not Prefix: this path is a REGEX, and Prefix is
-  # defined as literal element-wise matching. nginx honours the regex either
-  # way, but declaring Prefix would be a lie to any other controller.
-  path: /app(/|$)(.*)
-  pathType: ImplementationSpecific
+  # So the prefix is passed through untouched. gunicorn strips it itself, hands
+  # Flask a PATH_INFO of /, /add, /healthz -- which its routes already match --
+  # and Werkzeug prepends SCRIPT_NAME when building URLs, so url_for() emits
+  # /app/add. See config.env.SCRIPT_NAME below; the two must agree.
+  #
+  # Plain Prefix, no regex, because the backend wants the prefix left on.
+  path: /app
+  pathType: Prefix
 
   # Empty = the rule matches any Host header, which is what makes IP access
-  # work. Set this (and simplify `path` to /) to switch to hostname routing.
+  # work. Set this to switch to hostname routing.
   host: ""
 
-  annotations:
-    # Strip /app before the request reaches gunicorn. The Flask app defines
-    # routes at /, /add, /delete/<id> -- it has no /app prefix of its own, so
-    # without this every request 404s inside the container.
-    nginx.ingress.kubernetes.io/rewrite-target: /$2
-    nginx.ingress.kubernetes.io/use-regex: "true"
+  annotations: {}
 
 resources:
   requests:
@@ -86,16 +88,16 @@ config:
     # The other half of path-based routing, and the reason no application code
     # or image rebuild was needed for it.
     #
-    # The Ingress strips /app, so gunicorn sees PATH_INFO=/ and Flask's routes
-    # match. But url_for() would then emit href="/add" -- absolute, prefix-less
-    # -- and the browser would request http://<IP>/add, which no Ingress rule
-    # claims: 404 on every Add and Delete, from a page that rendered fine.
+    # gunicorn reads this into the WSGI environ, strips it from PATH_INFO, and
+    # Werkzeug prepends it when building URLs -- so Flask's routes keep matching
+    # /, /add, /healthz while url_for() emits /app/add. Without it the page
+    # renders but every form posts to /add, which no Ingress rule claims: 404 on
+    # Add and Delete from a page that looked fine.
     #
-    # gunicorn copies this variable into the WSGI environ as SCRIPT_NAME, which
-    # is exactly what Werkzeug prepends when building URLs. url_for() then emits
-    # /app/add and the forms post back through the Ingress.
-    #
-    # Must match the Ingress path prefix. Change one, change both.
+    # Must match ingress.path exactly. gunicorn 500s on any request path that
+    # does not start with it, so a mismatch takes the pod down via its probes,
+    # not just the links. The probe paths in rollout.yaml are derived from this
+    # value for that reason.
     SCRIPT_NAME: "/app"
 
   # Whole file bodies, mounted read-only at mountPath, one file per key. Empty
