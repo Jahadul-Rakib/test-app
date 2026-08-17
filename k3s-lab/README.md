@@ -2448,6 +2448,7 @@ orb doctor
 | Build Image stage prints kaniko's whole help text, exit 1 | an unrecognised kaniko flag; it never says which | check flag spelling against the dump (`--tar-path`, not `--tarball-path`) |
 | Several unrelated pods restart at once, `exit 0` + `context deadline exceeded` | k3s datastore I/O-starved; `/readyz` fails `etcd-readiness` | reduce load; this is the host, not the pods |
 | Argo CD `Synced` but the old image is running | reconciliation stalled; `sync.revision` is stale | compare it to `git rev-parse origin/main`; `annotate ... refresh=hard` |
+| Pods stuck `Unknown` after `orb stop`/`start`; a StatefulSet will not replace them | stale pod records from the pre-restart kubelet | `kubectl delete pod <name> --force --grace-period=0` |
 | LB address assigned, ARP `(incomplete)`, works from inside the cluster | speakers restarted and lost the L2 election | `kubectl -n metallb-system rollout restart ds/metallb-speaker` |
 
 ---
