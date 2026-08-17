@@ -2328,6 +2328,41 @@ applies to `--snapshot-mode` (not `--snapshotMode`) and `--log-format`. When a
 kaniko stage fails with a wall of usage text, diff your flags against that dump
 before suspecting the registry, the context path, or permissions.
 
+### Argo CD says `Synced` but the running image is the old one
+
+The most dangerous state in this document, because the dashboard is green and
+lying. Argo CD reports `Synced / Healthy` while the pods run a previous tag:
+
+```sh
+kubectl -n argocd get application notes-app \
+  -o jsonpath='{.status.sync.status}{" rev="}{.status.sync.revision}{"\n"}'
+kubectl -n default get rollout notes-app-notes-app \
+  -o jsonpath='{.spec.template.spec.containers[0].image}{"\n"}'
+```
+
+```
+Synced rev=1d94ac6e...                       <-- the commit BEFORE the deploy commit
+docker.io/jahadulrakib/notes-app:c9f26d59... <-- an older tag still running
+```
+
+`Synced` means "the cluster matches **the revision Argo CD last fetched**", not
+"the cluster matches git". When the datastore is starved (see the
+`etcd-readiness` entry) the reconciliation loop stalls, the cached revision goes
+stale, and the comparison keeps passing against it. Nothing reports an error,
+because from Argo CD's point of view nothing is wrong.
+
+**Always compare `status.sync.revision` against `git rev-parse origin/main`**
+before trusting `Synced`. Force a re-poll with:
+
+```sh
+kubectl -n argocd annotate application notes-app \
+  argocd.argoproj.io/refresh=hard --overwrite
+```
+
+It flips to `OutOfSync` within seconds and auto-sync then applies the real
+change. This is also why `timeout.reconciliation: 60s` is set in step 16 — the
+180s default widens exactly this window.
+
 ### "Everything broke after a Mac reboot"
 
 OrbStack renumbered the machines by DHCP; `--node-ip` and the kubeconfig are now
@@ -2412,6 +2447,7 @@ orb doctor
 | Agent logs `Connected`, controller loops `Waiting for agent to connect` | JNLP over TCP 50000 never registers | `--set agent.websocket=true` |
 | Build Image stage prints kaniko's whole help text, exit 1 | an unrecognised kaniko flag; it never says which | check flag spelling against the dump (`--tar-path`, not `--tarball-path`) |
 | Several unrelated pods restart at once, `exit 0` + `context deadline exceeded` | k3s datastore I/O-starved; `/readyz` fails `etcd-readiness` | reduce load; this is the host, not the pods |
+| Argo CD `Synced` but the old image is running | reconciliation stalled; `sync.revision` is stale | compare it to `git rev-parse origin/main`; `annotate ... refresh=hard` |
 | LB address assigned, ARP `(incomplete)`, works from inside the cluster | speakers restarted and lost the L2 election | `kubectl -n metallb-system rollout restart ds/metallb-speaker` |
 
 ---
