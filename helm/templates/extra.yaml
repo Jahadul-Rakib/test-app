@@ -1,0 +1,35 @@
+{{- /*
+extraManifests -- the escape hatch.
+
+Anything this chart has no opinion about goes here: Role and RoleBinding,
+NetworkPolicy, ServiceMonitor, PVC, CronJob, VerticalPodAutoscaler, a second
+Service. Nothing renders when the list is empty.
+
+Each entry is rendered through `tpl`, so values and built-ins work inside it:
+
+  extraManifests:
+    - apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: {{ "{{" }} .Release.Name {{ "}}" }}-extra
+        namespace: {{ "{{" }} .Release.Namespace {{ "}}" }}
+
+Two things to know:
+
+  * These manifests get NO labels and NO name prefix from the chart. You write
+    metadata.name yourself, and it is yours to keep unique -- two entries with the
+    same name and kind is an apply-time conflict, not a lint error.
+
+  * tpl means the body IS a template. A literal {{ }} in the YAML -- a Prometheus
+    recording rule, a Go template in a mounted config -- will be evaluated and
+    almost certainly fail the render. Put that kind of content in config.files
+    with the braces escaped, or ship it inside the image.
+
+Self-contained: no preamble needed, since nothing here is named by the chart.
+*/ -}}
+{{- range $i, $manifest := (.Values.extraManifests | default list) }}
+{{- /* Leading separator on every document, including the first: this file may be
+       one of several the chart emits, and Helm concatenates them. */}}
+---
+{{ tpl (toYaml $manifest) $ }}
+{{- end }}

@@ -1103,6 +1103,11 @@ Four things: two cluster secrets, a signing keypair, and the Jenkins entries.
 Every `read -rs` below reads with echo off, so no token reaches your shell
 history or the process list.
 
+> **No real token appears in this document.** Every credential below is a
+> placeholder you replace at the moment you run the command. Pasting a live PAT
+> into a markdown file puts it in git history, where `git rm` cannot reach it —
+> the only fix at that point is to revoke the token.
+
 ### 9.1 Argo CD repository credential — required
 
 Argo CD cannot clone a private repo without this, and the Application sits in
@@ -1110,8 +1115,13 @@ Argo CD cannot clone a private repo without this, and the Application sits in
 it cannot come from the chart, because Argo CD needs it to clone the repo that
 holds the chart.
 
+`read -rs` keeps the token out of your shell history and out of `ps` output, and
+the heredoc is unquoted so `$GH_PAT` expands — the token exists only in this
+shell's memory.
+
 ```sh
-kubectl apply -f - <<'EOF'
+read -rs -p 'GitHub PAT (repo scope): ' GH_PAT && echo
+kubectl apply -f - <<EOF
 apiVersion: v1
 kind: Secret
 metadata:
@@ -1128,13 +1138,14 @@ stringData:
   # scheme and trailing .git included.
   url: https://github.com/Jahadul-Rakib/test-app.git
   username: Jahadul-Rakib
-  password: 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
+  password: ${GH_PAT}
 EOF
+unset GH_PAT
 ```
 
-Argo CD only clones, so a read-only `repo` PAT is enough here — the token above
-is the same write-scoped one Jenkins uses, which is fine for a demo but means a
-single revoke breaks both.
+Argo CD only clones, so a read-only `repo` PAT is enough here. Reusing the
+write-scoped token Jenkins needs works, but means a single revoke breaks both —
+two tokens is the better habit.
 
 Re-running rotates the token in place. Check it in the UI: **Settings →
 Repositories** at `http://<LB_IP>/argocd` — `CONNECTION STATUS` must read
@@ -1151,12 +1162,14 @@ Consumed by the **kubelet**, so it belongs in the namespace where the pod runs
 field, from a username and token — nothing to encode by hand.
 
 ```sh
+read -rs -p 'Docker Hub access token: ' DOCKER_PAT && echo
 kubectl create secret docker-registry dockerhub-pull \
   --namespace default \
   --docker-server=https://index.docker.io/v1/ \
   --docker-username=jahadulrakib \
-  --docker-password=dckr_pat_getuazgIuPPCJFgRfkJQ5_mjRQQ \
+  --docker-password="$DOCKER_PAT" \
   --dry-run=client -o yaml | kubectl apply -f -
+unset DOCKER_PAT
 ```
 
 The `--dry-run | apply` pipe is what makes it re-runnable — plain
@@ -1166,7 +1179,7 @@ The chart only *references* this by name, never creates it, which keeps the
 token out of git:
 
 ```yaml
-# helm/notes-app/values.yaml
+# helm/values.yaml
 imagePullSecrets:
   - name: dockerhub-pull
 ```
@@ -1176,15 +1189,26 @@ and never reads the secret.
 
 ### 9.3 Jenkins credentials
 
-The IDs must match exactly — the `Jenkinsfile` looks them up by ID:
+The IDs must match exactly — the `Jenkinsfile` looks them up by ID. Type the
+values straight into the Jenkins UI; do not stage them in a file first.
 
-| ID | Kind | Username | Password / content                         |
-|---|---|---|--------------------------------------------|
-| `github-token` | Username with password | `Jahadul-Rakib` | `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` |
-| `dockerhub` | Username with password | `jahadulrakib` | `dckr_pat_getuazgIuPPCJFgRfkJQ5_mjRQQ`     |
-| `cosign-key` | Secret text | — | in below.....                              |
-| `cosign-key-password` | Secret text | — | `jBSXFSWcBmTGn2tfVAA9fUtuRrofq3cCW1c1vDBQ` |
+| ID | Kind | Username | Password / content |
+|---|---|---|---|
+| `github-token` | Username with password | `Jahadul-Rakib` | GitHub PAT, **write** `repo` scope |
+| `dockerhub` | Username with password | `jahadulrakib` | Docker Hub access token, Read/Write |
+| `cosign-key` | Secret text | — | contents of `abc_local_setup/cosign/cosign.key` |
+| `cosign-key-password` | Secret text | — | contents of `abc_local_setup/cosign/cosign.password` |
 
+Generate the keypair if you do not have one — it writes the three files this
+table refers to, and the password is whatever you type at the prompt:
+
+```sh
+cd abc_local_setup/cosign && cosign generate-key-pair
+```
+
+> **Keep `cosign.key` and `cosign.password` out of git.** They are the private
+> half of your supply-chain signature: anyone holding both can sign an image as
+> you. Add them to `.gitignore` before the first commit.
 
 **cosign-key:**
 
@@ -1207,17 +1231,18 @@ The IDs must match exactly — the `Jenkinsfile` looks them up by ID:
 > `string(...)` to `file(credentialsId: ..., variable: 'COSIGN_KEY_FILE')`,
 > passing `--key "$COSIGN_KEY_FILE"` directly.
 
+Copy it straight out of the file rather than reading it off a screen — the body
+is one long base64 blob and a single dropped character makes the key undecryptable:
+
+```sh
+cat abc_local_setup/cosign/cosign.key
+```
+
+The shape you should see, with the base64 body elided:
+
 ```
 -----BEGIN ENCRYPTED SIGSTORE PRIVATE KEY-----
-eyJrZGYiOnsibmFtZSI6InNjcnlwdCIsInBhcmFtcyI6eyJOIjo2NTUzNiwiciI6
-OCwicCI6MX0sInNhbHQiOiJJUmpFeTNWeGNUUG5McTRJaFdQMVo2cHR3NjRYWlBQ
-cDNmdWxSNmVvWmVNPSJ9LCJjaXBoZXIiOnsibmFtZSI6Im5hY2wvc2VjcmV0Ym94
-Iiwibm9uY2UiOiJHWGN3dFlhSW11Qld6eHdRN3U5eFdrc2NEa1llc1VtdyJ9LCJj
-aXBoZXJ0ZXh0IjoiK1V1M24wbE05UlFRVk1YTmhoSkc0eWJmUUxFTzIxNndWQzRn
-N0V5ekFlSlZubWpiRzZtN0FVamVXZDlvTzFXK2JZcE5XOGJNWE5naTBWeUR6N1J0
-SWREaEJickg3TTRkWXNWWE4vZVRvdWliQ3NET1ljdUhYcHlKNEk3K2dPMmtiRVA3
-ekVic3ZBVjh6T3lSeWNubFFWK0ErMkpKT09SV2FqTWxseXVMaGxYMWRyT2cvVEFU
-TWtBZ1pJcmZpWnRXcVhPeVh5TmJhR3JEdXc9PSJ9
+<base64 body -- roughly 10 lines; never paste your real key into a file>
 -----END ENCRYPTED SIGSTORE PRIVATE KEY-----
 ```
 
@@ -1411,10 +1436,10 @@ the toleration, which on a live node means kicking off whatever was there.
 
 ### 10.5 Send the app to it
 
-The chart already carries the wiring — `gpu` in `helm/notes-app/values.yaml`:
+The chart already carries the wiring — `gpu` in `helm/values.yaml`:
 
 ```sh
-helm upgrade --install notes-app helm/notes-app --set gpu.enabled=true
+helm upgrade --install notes-app helm --set gpu.enabled=true
 kubectl get pods -o wide          # lands on $NODE, Running
 ```
 
@@ -1430,10 +1455,10 @@ differently:
 Break it on purpose — this is the part worth having seen before someone asks:
 
 ```sh
-helm upgrade notes-app helm/notes-app --set gpu.enabled=true --set gpu.tolerations=null
+helm upgrade notes-app helm --set gpu.enabled=true --set gpu.tolerations=null
 kubectl describe pod -l app.kubernetes.io/name=notes-app | grep -A5 Events
 
-helm upgrade notes-app helm/notes-app --set gpu.enabled=true --set gpu.count=99
+helm upgrade notes-app helm --set gpu.enabled=true --set gpu.count=99
 kubectl describe pod -l app.kubernetes.io/name=notes-app | grep -A5 Events
 ```
 
@@ -1483,7 +1508,7 @@ and a `MIG_CONFIGURATION` ConfigMap, and the resource name becomes e.g.
 ### 10.7 Undo
 
 ```sh
-helm upgrade notes-app helm/notes-app                  # gpu.enabled back to false
+helm upgrade notes-app helm                  # gpu.enabled back to false
 kubectl taint node "$NODE" nvidia.com/gpu-
 kubectl label node "$NODE" nvidia.com/gpu.present- nvidia.com/gpu.count-
 ```
@@ -1929,12 +1954,20 @@ When you have real DNS pointing `jenkins.example.com`, `app.example.com` and
 
 | Release | Change |
 |---|---|
-| notes-app | `ingress.host: app.example.com`, `ingress.path: /` |
+| notes-app | `ingress.hosts[0].host: app.example.com`, its `paths[0].path: /` |
 | Jenkins | `controller.ingress.hostName: jenkins.example.com`, `path: /`, drop `jenkinsUriPrefix`, set `jenkinsUrl` to the hostname |
 | Argo CD | `global.domain: argocd.example.com`, drop `server.rootpath` / `server.basehref`, `server.ingress.path: /` |
 
-The chart in `helm/notes-app` already supports this: `ingress.host` is an
-optional value, and setting it adds a `host:` to the rule.
+The chart in `helm` already supports this: `ingress.hosts` is a list of
+`{host, paths}`, `host` is optional, and setting it adds a `host:` to that rule.
+Edit it in `helm/values.yaml` — **not** with `--set`, which replaces the whole
+list entry and drops its `paths` (the chart fails with a message saying so
+rather than rendering a broken Ingress).
+
+Dropping the prefix means dropping `SCRIPT_NAME` too: clear it in `config.env`
+**and** change both probe paths from `/app/healthz` to `/healthz` in the same
+commit. gunicorn returns 500 for any request path that does not start with
+`SCRIPT_NAME`, so a half-done change CrashLoopBackOffs the pod.
 
 Two things get simpler at that point: each app is back at `/`, so no prefix
 handling is needed anywhere, and the Argo CD UI limitation in step 8.3

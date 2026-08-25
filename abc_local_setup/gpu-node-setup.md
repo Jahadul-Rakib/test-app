@@ -223,7 +223,7 @@ grep -A3 'containerd.runtimes.nvidia' /etc/containerd/config.toml
 > runs under the NVIDIA runtime — simple, and what a dedicated GPU node wants.
 > Without it, pods must ask for the runtime by name, which needs a RuntimeClass
 > and `runtimeClassName: nvidia` in the pod spec (that is what the
-> `runtimeClassName` value in `helm/notes-app/values.yaml` is for):
+> `runtimeClassName` value in `helm/values.yaml` is for):
 >
 > ```sh
 > kubectl apply -f - <<'EOF'

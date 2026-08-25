@@ -1,0 +1,15 @@
+apiVersion: v2
+
+# Deliberately generic. Nothing in templates/ names an app -- the app's identity
+# comes from `nameOverride` + `image` in values.yaml, so one chart serves any
+# number of apps. Change values.yaml, never the templates.
+name: helm
+description: Generic app chart -- Deployment/Rollout/StatefulSet/DaemonSet, optional GPU
+type: application
+
+# Bumped from 0.1.0: the chart moved to helm/, _helpers.tpl is gone, and the
+# workload kind is now a value. Breaking for anyone who templated the old paths.
+version: 0.2.0
+
+# Overridden per app. Only used for the app.kubernetes.io/version label.
+appVersion: "1.0.0"

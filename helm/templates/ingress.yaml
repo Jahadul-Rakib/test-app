@@ -1,0 +1,74 @@
+{{- /*
+Ingress -- multi-host, multi-path, optional TLS.
+
+Behind MetalLB + ingress-nginx one LoadBalancer IP fronts every service and each
+Ingress claims a path under it. A rule with NO host matches any Host header,
+which is what lets http://<METALLB-IP>/app work with no DNS and no /etc/hosts
+entry; set a host later to move to hostname routing without touching anything
+else.
+
+Self-contained: the preamble is the same four lines as every other template here.
+*/ -}}
+{{- $name := .Values.nameOverride | default .Chart.Name -}}
+{{- $fullname := .Values.fullnameOverride | default (ternary .Release.Name (printf "%s-%s" .Release.Name $name) (contains $name .Release.Name)) | trunc 63 | trimSuffix "-" -}}
+{{- $selector := dict "app.kubernetes.io/name" $name "app.kubernetes.io/instance" .Release.Name -}}
+{{- $labels := merge (dict "app.kubernetes.io/managed-by" .Release.Service "helm.sh/chart" (printf "%s-%s" .Chart.Name .Chart.Version) "app.kubernetes.io/version" (.Chart.AppVersion | toString)) $selector (.Values.commonLabels | default dict) -}}
+{{- $ing := .Values.ingress | default dict -}}
+{{- $svcPort := (.Values.service).port | default 80 -}}
+{{- if $ing.enabled }}
+{{- if not (.Values.service).enabled }}
+{{-   fail "ingress.enabled is true but service.enabled is false -- an Ingress with no backend Service is created, gets no ADDRESS, and serves 503" }}
+{{- end }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ $fullname }}
+  labels:
+    {{- toYaml $labels | nindent 4 }}
+  {{- $ann := merge (dict) ($ing.annotations | default dict) (.Values.commonAnnotations | default dict) }}
+  {{- with $ann }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- /* Must match an installed IngressClass. Wrong or empty and no controller
+         claims the Ingress: it exists, has no ADDRESS, and nothing serves it. */}}
+  ingressClassName: {{ $ing.className | default "nginx" }}
+  {{- with $ing.tls }}
+  {{- /* Each entry needs an existing kubernetes.io/tls Secret in this namespace
+         holding tls.crt + tls.key. cert-manager can create it from an
+         annotation above; otherwise create it yourself. */}}
+  tls:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  rules:
+    {{- range $i, $h := $ing.hosts }}
+    {{- /* A host entry with no paths renders `paths: null`, which the API server
+           rejects with "spec.rules[0].http.paths: Required value" -- and which
+           `--set ingress.hosts[0].host=x` produces silently, because --set on a
+           list index REPLACES the whole element and drops its siblings. Set hosts
+           in values.yaml or with -f, not with --set. */}}
+    {{- if not $h.paths }}
+    {{-   fail (printf "ingress.hosts[%d] has no paths. --set on a list index replaces the whole entry -- set ingress.hosts in values.yaml or a -f file instead." $i) }}
+    {{- end }}
+    {{- /* `http` before `host` so an omitted host cannot leave a dangling key.
+           YAML is order-independent, so this renders identically either way. */}}
+    - http:
+        paths:
+          {{- range $h.paths }}
+          - path: {{ .path }}
+            {{- /* Prefix matches on whole path segments: /app matches /app/x but
+                   not /application. ImplementationSpecific is what you need for
+                   an nginx regex capture used with rewrite-target. */}}
+            pathType: {{ .pathType | default "Prefix" }}
+            backend:
+              service:
+                name: {{ $fullname }}
+                port:
+                  number: {{ .servicePort | default $svcPort }}
+          {{- end }}
+      {{- with $h.host }}
+      host: {{ . }}
+      {{- end }}
+    {{- end }}
+{{- end }}

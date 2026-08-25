@@ -1,0 +1,61 @@
+{{- /*
+ConfigMap -- non-secret configuration. Two shapes, two independent ConfigMaps:
+
+  config.env    -> flat key/value, injected as environment variables (envFrom)
+  config.files  -> whole file bodies, mounted at config.mountPath
+
+No `enabled` flag: pass data and the ConfigMap is created, leave it empty and
+nothing renders. Both are wired into the pod by workload.yaml, which also carries
+a `checksum/config` annotation over this file so an edit here restarts pods.
+That hash is BY PATH -- rename this file and update the path in workload.yaml or
+restart-on-change silently stops.
+
+Credentials do NOT belong here. A ConfigMap is plain text in etcd and readable by
+anything with `get` on the namespace -- see secret.yaml.
+
+Self-contained: the preamble is the same four lines as every other template here.
+*/ -}}
+{{- $name := .Values.nameOverride | default .Chart.Name -}}
+{{- $fullname := .Values.fullnameOverride | default (ternary .Release.Name (printf "%s-%s" .Release.Name $name) (contains $name .Release.Name)) | trunc 63 | trimSuffix "-" -}}
+{{- $selector := dict "app.kubernetes.io/name" $name "app.kubernetes.io/instance" .Release.Name -}}
+{{- $labels := merge (dict "app.kubernetes.io/managed-by" .Release.Service "helm.sh/chart" (printf "%s-%s" .Chart.Name .Chart.Version) "app.kubernetes.io/version" (.Chart.AppVersion | toString)) $selector (.Values.commonLabels | default dict) -}}
+{{- /* Read through a defaulted local so this file drops into a chart with no
+       `config:` block at all -- a bare .Values.config.env would nil-pointer. */ -}}
+{{- $cfg := .Values.config | default dict -}}
+{{- if $cfg.env }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $fullname }}-config
+  labels:
+    {{- toYaml $labels | nindent 4 }}
+data:
+  {{- range $key, $value := $cfg.env }}
+  {{- /* quote is not cosmetic: an unquoted `true` or `8080` is a YAML bool/int,
+         and the API server rejects a ConfigMap whose data values are not strings
+         with "cannot unmarshal bool into Go value of type string". */}}
+  {{ $key }}: {{ $value | quote }}
+  {{- end }}
+{{- end }}
+{{- if $cfg.files }}
+{{- if $cfg.env }}
+---
+{{- /* No `-` on the closing brace above: `-}}` would eat the newline after the
+       `---` and render `---apiVersion: v1`, which is not a document separator
+       and fails helm lint with "invalid Yaml document separator". */}}
+{{- end }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $fullname }}-files
+  labels:
+    {{- toYaml $labels | nindent 4 }}
+data:
+  {{- range $file, $content := $cfg.files }}
+  {{- /* tpl re-renders the body as a template, so a file can reference values --
+         e.g. {{ .Release.Namespace }} inside the string in values.yaml. A file
+         that needs literal {{ }} has to be passed some other way. */}}
+  {{ $file }}: |-
+    {{- tpl $content $ | nindent 4 }}
+  {{- end }}
+{{- end }}

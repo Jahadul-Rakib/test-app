@@ -1,0 +1,87 @@
+{{- /*
+Service -- stable, plus an optional canary Service when Rollouts traffic routing
+is on, plus a headless Service when the workload is a StatefulSet.
+
+Self-contained: the preamble below is the same four lines as every other template
+in this chart (there is no _helpers.tpl).
+*/ -}}
+{{- $name := .Values.nameOverride | default .Chart.Name -}}
+{{- $fullname := .Values.fullnameOverride | default (ternary .Release.Name (printf "%s-%s" .Release.Name $name) (contains $name .Release.Name)) | trunc 63 | trimSuffix "-" -}}
+{{- $selector := dict "app.kubernetes.io/name" $name "app.kubernetes.io/instance" .Release.Name -}}
+{{- $labels := merge (dict "app.kubernetes.io/managed-by" .Release.Service "helm.sh/chart" (printf "%s-%s" .Chart.Name .Chart.Version) "app.kubernetes.io/version" (.Chart.AppVersion | toString)) $selector (.Values.commonLabels | default dict) -}}
+{{- $svc := .Values.service | default dict -}}
+{{- $isSts := eq ((.Values.workload).kind | default "Deployment") "StatefulSet" -}}
+{{- /* Port list built once and reused by all three Services below, so the canary
+       and the stable Service can never disagree about ports. */ -}}
+{{- $main := dict "name" "http" "port" ($svc.port | default 80) "targetPort" ($svc.targetPort | default "http") "protocol" "TCP" -}}
+{{- if $svc.nodePort -}}
+{{-   $_ := set $main "nodePort" $svc.nodePort -}}
+{{- end -}}
+{{- $ports := concat (list $main) ($svc.extraPorts | default list) -}}
+{{- if $svc.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $fullname }}
+  labels:
+    {{- toYaml $labels | nindent 4 }}
+  {{- $ann := merge (dict) ($svc.annotations | default dict) (.Values.commonAnnotations | default dict) }}
+  {{- with $ann }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ $svc.type | default "ClusterIP" }}
+  {{- /* clusterIP: None turns off the virtual IP: DNS then returns the pod IPs
+         directly instead of load-balancing to one of them. Required for a
+         StatefulSet's per-pod DNS names. */}}
+  {{- if or $svc.headless $isSts }}
+  clusterIP: None
+  {{- end }}
+  ports:
+    {{- toYaml $ports | nindent 4 }}
+  selector:
+    {{- toYaml $selector | nindent 4 }}
+{{- end }}
+{{- if and $isSts $svc.enabled }}
+---
+{{- /* Governing Service for the StatefulSet. Named -headless to match
+       spec.serviceName in workload.yaml.
+       No `-` on the closing brace above: `-}}` would eat the newline after the
+       `---` and render `---apiVersion: v1`, which is not a document separator
+       and fails helm lint with "invalid Yaml document separator". */}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $fullname }}-headless
+  labels:
+    {{- toYaml $labels | nindent 4 }}
+spec:
+  clusterIP: None
+  {{- /* Pods get DNS before they are Ready, so an ordered StatefulSet can find
+         its own peers while still starting up. */}}
+  publishNotReadyAddresses: true
+  ports:
+    {{- toYaml $ports | nindent 4 }}
+  selector:
+    {{- toYaml $selector | nindent 4 }}
+{{- end }}
+{{- if and $svc.enabled ((.Values.workload).canary).trafficRouting }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $fullname }}-canary
+  labels:
+    {{- toYaml $labels | nindent 4 }}
+spec:
+  type: {{ $svc.type | default "ClusterIP" }}
+  ports:
+    {{- toYaml $ports | nindent 4 }}
+  {{- /* Selector deliberately has no pod-template hash: the Rollouts controller
+         writes one in to steer traffic to the canary ReplicaSet. That is a live
+         mutation of a field Helm also owns, which is why
+         argocd/application.yaml ignores Service /spec/selector. */}}
+  selector:
+    {{- toYaml $selector | nindent 4 }}
+{{- end }}

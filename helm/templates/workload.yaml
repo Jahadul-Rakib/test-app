@@ -1,0 +1,332 @@
+{{- /*
+=============================================================================
+WORKLOAD -- Deployment | Rollout | StatefulSet | DaemonSet, chosen by
+workload.kind. One file for all four, because they differ in about six lines and
+keeping them together is what keeps them consistent.
+
+SELF-CONTAINED. This chart has no _helpers.tpl. The preamble below recomputes
+the names and labels a helper would have supplied, so this file can be lifted
+into any other chart on its own. Every template in templates/ opens with the
+same four lines -- change the naming rule and you change it in all of them
+(grep for '$fullname :=').
+
+Nothing here names an app: the name comes from nameOverride, the image from
+`image`, the ports and probes from values. Edit values.yaml, not this file.
+=============================================================================
+*/ -}}
+
+{{- /* --- names + labels (replaces _helpers.tpl) --------------------------- */ -}}
+{{- $name := .Values.nameOverride | default .Chart.Name -}}
+{{- $fullname := .Values.fullnameOverride | default (ternary .Release.Name (printf "%s-%s" .Release.Name $name) (contains $name .Release.Name)) | trunc 63 | trimSuffix "-" -}}
+{{- $selector := dict "app.kubernetes.io/name" $name "app.kubernetes.io/instance" .Release.Name -}}
+{{- /* merge is destination-wins and the standard keys are merged in first, so
+       commonLabels can add labels but can never break the selector. */ -}}
+{{- $labels := merge (dict "app.kubernetes.io/managed-by" .Release.Service "helm.sh/chart" (printf "%s-%s" .Chart.Name .Chart.Version) "app.kubernetes.io/version" (.Chart.AppVersion | toString)) $selector (.Values.commonLabels | default dict) -}}
+
+{{- /* --- kind -------------------------------------------------------------
+       Rollout is argoproj.io/v1alpha1 and needs the Argo Rollouts CRDs; the
+       other three are core apps/v1. Only Deployment and Rollout spell the update
+       policy `strategy` -- StatefulSet and DaemonSet call it `updateStrategy`,
+       which is why the switch below exists rather than one pass-through. */ -}}
+{{- $w := .Values.workload | default dict -}}
+{{- $kind := $w.kind | default "Deployment" -}}
+{{- if not (has $kind (list "Deployment" "Rollout" "StatefulSet" "DaemonSet")) -}}
+{{-   fail (printf "workload.kind %q is not supported -- use Deployment, Rollout, StatefulSet or DaemonSet" $kind) -}}
+{{- end -}}
+{{- $isRollout := eq $kind "Rollout" -}}
+{{- $isSts := eq $kind "StatefulSet" -}}
+{{- $isDs := eq $kind "DaemonSet" -}}
+
+{{- /* --- GPU ---------------------------------------------------------------
+       gpu.vendor selects a preset; anything set explicitly overrides it. The
+       table is the same one as §0.3 of gpu_node_setup/k3s_gpu_node_setup.md, so
+       the guide and the chart cannot drift.
+       With gpu.enabled false every variable below stays empty and the render is
+       byte-identical to a chart that knows nothing about GPUs. */ -}}
+{{- $gpu := .Values.gpu | default dict -}}
+{{- $gpuRes := "" -}}
+{{- $gpuLabel := "" -}}
+{{- if $gpu.enabled -}}
+{{-   $presets := dict
+        "nvidia" (dict "resource" "nvidia.com/gpu"     "label" "nvidia.com/gpu.present")
+        "amd"    (dict "resource" "amd.com/gpu"        "label" "feature.node.kubernetes.io/amd-gpu")
+        "intel"  (dict "resource" "gpu.intel.com/i915" "label" "gpu.intel.com/i915") -}}
+{{-   $p := get $presets (lower ($gpu.vendor | default "nvidia")) | default dict -}}
+{{-   $gpuRes = $gpu.resourceName | default (get $p "resource") -}}
+{{-   $gpuLabel = get $p "label" -}}
+{{-   if not $gpuRes -}}
+{{-     fail (printf "gpu.enabled is true but the resource name is unknown: gpu.vendor=%q is not nvidia, amd or intel. Set gpu.resourceName (and gpu.nodeSelector) explicitly." ($gpu.vendor | default "")) -}}
+{{-   end -}}
+{{- end -}}
+
+{{- /* Extended resources go in limits ONLY. Kubernetes copies them into
+       requests automatically, so the two can never disagree; writing both by
+       hand is how you get a pod that reserves two GPUs and may use one. */ -}}
+{{- $res := deepCopy (.Values.resources | default dict) -}}
+{{- if $gpu.enabled -}}
+{{-   $limits := deepCopy ($res.limits | default dict) -}}
+{{-   $_ := set $limits $gpuRes ($gpu.count | default 1) -}}
+{{-   $_ = set $res "limits" $limits -}}
+{{- end -}}
+
+{{- /* A GPU limit alone only makes the pod Pending. These two are what put it
+       on the machine that actually has the card: the vendor's node label, and a
+       toleration for the taint that keeps CPU work off GPU nodes. */ -}}
+{{- $nodeSel := deepCopy (.Values.nodeSelector | default dict) -}}
+{{- $tolerations := .Values.tolerations | default list -}}
+{{- if $gpu.enabled -}}
+{{-   $gpuSel := $gpu.nodeSelector | default dict -}}
+{{-   if and (not $gpuSel) $gpuLabel -}}
+{{-     $gpuSel = dict $gpuLabel "true" -}}
+{{-   end -}}
+{{-   $nodeSel = merge $nodeSel $gpuSel -}}
+{{-   $gpuTol := $gpu.tolerations | default list -}}
+{{-   if not $gpuTol -}}
+{{-     $gpuTol = list (dict "key" $gpuRes "operator" "Exists" "effect" "NoSchedule") -}}
+{{-   end -}}
+{{-   $tolerations = concat $tolerations $gpuTol -}}
+{{- end -}}
+
+{{- /* --- env ----------------------------------------------------------------
+       `env` (a map) is flattened to literal name/value pairs; gpu.env is folded
+       in only when GPUs are on; `envRaw` is appended verbatim so valueFrom keeps
+       working. Map iteration in Go templates is key-sorted, so the render is
+       stable and Argo CD does not see a diff every sync. */ -}}
+{{- $env := list -}}
+{{- range $k, $v := (.Values.env | default dict) -}}
+{{-   $env = append $env (dict "name" $k "value" ($v | toString)) -}}
+{{- end -}}
+{{- if $gpu.enabled -}}
+{{-   range $k, $v := ($gpu.env | default dict) -}}
+{{-     $env = append $env (dict "name" $k "value" ($v | toString)) -}}
+{{-   end -}}
+{{- end -}}
+{{- $env = concat $env (.Values.envRaw | default list) -}}
+
+{{- /* --- envFrom / volumes -------------------------------------------------
+       The ConfigMap and Secret this chart renders are wired in automatically,
+       and only when they actually exist -- data present means resource created
+       means reference emitted. Reference a resource that was never rendered and
+       the pod hangs in CreateContainerConfigError. */ -}}
+{{- $cfg := .Values.config | default dict -}}
+{{- $sec := .Values.secrets | default dict -}}
+{{- $envFrom := list -}}
+{{- if $cfg.env -}}
+{{-   $envFrom = append $envFrom (dict "configMapRef" (dict "name" (printf "%s-config" $fullname))) -}}
+{{- end -}}
+{{- if $sec.env -}}
+{{-   $envFrom = append $envFrom (dict "secretRef" (dict "name" (printf "%s-secret" $fullname))) -}}
+{{- end -}}
+{{- $envFrom = concat $envFrom (.Values.extraEnvFrom | default list) -}}
+
+{{- $volumes := .Values.volumes | default list -}}
+{{- $mounts := .Values.volumeMounts | default list -}}
+{{- if $cfg.files -}}
+{{-   $volumes = append $volumes (dict "name" "config-files" "configMap" (dict "name" (printf "%s-files" $fullname))) -}}
+{{-   $mounts = append $mounts (dict "name" "config-files" "mountPath" ($cfg.mountPath | default "/etc/config") "readOnly" true) -}}
+{{- end -}}
+{{- if $sec.files -}}
+{{- /* defaultMode 256 is 0400 -- owner read only. Secret mounts are always
+       read-only, so readOnly here is documentation, not enforcement. */ -}}
+{{-   $volumes = append $volumes (dict "name" "secret-files" "secret" (dict "secretName" (printf "%s-secret-files" $fullname) "defaultMode" 256)) -}}
+{{-   $mounts = append $mounts (dict "name" "secret-files" "mountPath" ($sec.mountPath | default "/etc/secrets") "readOnly" true) -}}
+{{- end -}}
+
+{{- /* --- containers --------------------------------------------------------
+       The app container is built as data so sidecars can simply be appended --
+       one `containers:` block, no duplicated YAML. */ -}}
+{{- $c := dict "name" $name "image" .Values.image "imagePullPolicy" (.Values.imagePullPolicy | default "IfNotPresent") -}}
+{{- with .Values.command }}{{- $_ := set $c "command" . }}{{- end -}}
+{{- with .Values.args }}{{- $_ := set $c "args" . }}{{- end -}}
+{{- with .Values.ports }}{{- $_ := set $c "ports" . }}{{- end -}}
+{{- with $env }}{{- $_ := set $c "env" . }}{{- end -}}
+{{- with $envFrom }}{{- $_ := set $c "envFrom" . }}{{- end -}}
+{{- with .Values.livenessProbe }}{{- $_ := set $c "livenessProbe" . }}{{- end -}}
+{{- with .Values.readinessProbe }}{{- $_ := set $c "readinessProbe" . }}{{- end -}}
+{{- with .Values.startupProbe }}{{- $_ := set $c "startupProbe" . }}{{- end -}}
+{{- with .Values.lifecycle }}{{- $_ := set $c "lifecycle" . }}{{- end -}}
+{{- with $res }}{{- $_ := set $c "resources" . }}{{- end -}}
+{{- with .Values.securityContext }}{{- $_ := set $c "securityContext" . }}{{- end -}}
+{{- with $mounts }}{{- $_ := set $c "volumeMounts" . }}{{- end -}}
+{{- $containers := concat (list $c) (.Values.sidecars | default list) -}}
+{{- $sa := .Values.serviceAccount | default dict -}}
+{{- $canary := $w.canary | default dict -}}
+apiVersion: {{ if $isRollout }}argoproj.io/v1alpha1{{ else }}apps/v1{{ end }}
+kind: {{ $kind }}
+metadata:
+  name: {{ $fullname }}
+  labels:
+    {{- toYaml $labels | nindent 4 }}
+  {{- with .Values.commonAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- /* A DaemonSet has no replicas (one pod per node). Under an HPA the field
+         is omitted too: leaving it in means Helm writes `replicas` on every sync
+         and the HPA writes it back, so the app oscillates forever. */}}
+  {{- if and (not $isDs) (not (.Values.autoscaling).enabled) }}
+  replicas: {{ $w.replicaCount | default 1 }}
+  {{- end }}
+  revisionHistoryLimit: {{ $w.revisionHistoryLimit | default 10 }}
+  {{- with $w.minReadySeconds }}
+  minReadySeconds: {{ . }}
+  {{- end }}
+  {{- if $isSts }}
+  {{- /* Not optional: a StatefulSet needs a headless Service to hand each pod
+         its stable DNS name. service.yaml forces headless on for this kind, so
+         this reference always resolves. */}}
+  serviceName: {{ $fullname }}-headless
+  podManagementPolicy: {{ $w.podManagementPolicy | default "OrderedReady" }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- toYaml $selector | nindent 6 }}
+  {{- if $isRollout }}
+  strategy:
+    canary:
+      {{- if $canary.trafficRouting }}
+      # Rollouts rewrites these two Services' selectors to steer traffic, which
+      # is why argocd/application.yaml ignores Service /spec/selector.
+      stableService: {{ $fullname }}
+      canaryService: {{ $fullname }}-canary
+      trafficRouting:
+        nginx:
+          stableIngress: {{ $fullname }}
+      {{- end }}
+      maxSurge: {{ $canary.maxSurge | default 1 }}
+      maxUnavailable: {{ $canary.maxUnavailable | default 0 }}
+      {{- with $canary.steps }}
+      steps:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+  {{- else if $w.strategy }}
+  {{- /* Same concept, two spellings: Deployment says `strategy`, StatefulSet and
+         DaemonSet say `updateStrategy`. The wrong one is silently dropped by the
+         API server, so it is worth getting right here rather than wondering why
+         maxUnavailable had no effect. */}}
+  {{- if or $isSts $isDs }}
+  updateStrategy:
+    {{- toYaml $w.strategy | nindent 4 }}
+  {{- else }}
+  strategy:
+    {{- toYaml $w.strategy | nindent 4 }}
+  {{- end }}
+  {{- end }}
+  template:
+    metadata:
+      {{- if or $cfg.env $cfg.files $sec.env $sec.files .Values.podAnnotations .Values.commonAnnotations }}
+      annotations:
+        {{- /* Restart pods when config changes. Editing a ConfigMap leaves the
+               pod spec byte-identical, so neither Argo CD nor the Rollouts
+               controller sees a diff and pods keep serving old values. Hashing
+               the rendered file into an annotation makes the config part of the
+               pod template, so a change steps through the canary like any other.
+               Mounted files do refresh in place (~60s); env vars are read once
+               at exec time and never do.
+               The hash is BY PATH -- rename configmap.yaml or secret.yaml and
+               you must update these two lines or restart-on-change stops. */}}
+        {{- if or $cfg.env $cfg.files }}
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- end }}
+        {{- if or $sec.env $sec.files }}
+        checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
+        {{- end }}
+        {{- with .Values.commonAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- end }}
+      labels:
+        {{- /* The selector labels must be here verbatim or the workload adopts
+               no pods. Extra labels are additive and safe. */}}
+        {{- toYaml $selector | nindent 8 }}
+        {{- with .Values.commonLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if $sa.name }}
+      serviceAccountName: {{ $sa.name }}
+      {{- else if $sa.create }}
+      serviceAccountName: {{ $fullname }}
+      {{- end }}
+      {{- /* hasKey, not `if not $sa.automount`: the API default is true, and a
+             missing serviceAccount block must not silently flip it to false. */}}
+      {{- if and (hasKey $sa "automount") (not $sa.automount) }}
+      automountServiceAccountToken: false
+      {{- end }}
+      {{- with .Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- /* Where the pod is allowed to land. On a GPU cluster these two are
+             what separate "the chart asks for a GPU" from "the pod lands on the
+             machine that has one" -- a GPU limit on its own just leaves the pod
+             Pending with Insufficient <resource>. Both already include the
+             vendor's label and taint when gpu.enabled is set. */}}
+      {{- with $nodeSel }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- /* NVIDIA on K3s only: needed where the NVIDIA runtime is not the
+             containerd default. Without it the pod gets the default runtime,
+             sees no /dev/nvidia* devices, and CUDA fails inside a pod that
+             Kubernetes reports as perfectly healthy. AMD and Intel need no
+             RuntimeClass -- their device plugins pass the devices through. */}}
+      {{- with .Values.runtimeClassName }}
+      runtimeClassName: {{ . }}
+      {{- end }}
+      {{- with .Values.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
+      {{- if .Values.hostNetwork }}
+      hostNetwork: true
+      {{- end }}
+      {{- with .Values.dnsPolicy }}
+      dnsPolicy: {{ . }}
+      {{- end }}
+      {{- with .Values.terminationGracePeriodSeconds }}
+      terminationGracePeriodSeconds: {{ . }}
+      {{- end }}
+      {{- with .Values.initContainers }}
+      initContainers:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- /* Emitted from a list built in the preamble, so sidecars append with
+             no duplicated YAML. Passed through toYaml, NOT tpl: probe paths and
+             args must never be re-interpreted as templates. To reference the
+             namespace or pod name, use envRaw with a fieldRef -- that is
+             resolved by the kubelet and needs no templating. */}}
+      containers:
+        {{- toYaml $containers | nindent 8 }}
+      {{- with $volumes }}
+      volumes:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+  {{- if and $isSts $w.volumeClaimTemplates }}
+  {{- /* IMMUTABLE once created. Resizing or changing the storage class means
+         deleting the StatefulSet with --cascade=orphan and recreating it. */}}
+  volumeClaimTemplates:
+    {{- toYaml $w.volumeClaimTemplates | nindent 4 }}
+  {{- end }}

@@ -1860,7 +1860,7 @@ read `Successful`. `Failed` almost always means `url` does not match `repoURL`.
 
 ### 18.2 Docker Hub pull secret — only for a private image
 
-`helm/notes-app/values.yaml` ships `imagePullSecrets: []` so the chart installs
+`helm/values.yaml` ships `imagePullSecrets: []` so the chart installs
 anywhere. If the image repo is private, create the secret **in the namespace the
 pod runs in** — it is read by the kubelet, not by Helm or Argo CD:
 
@@ -1938,7 +1938,7 @@ Jenkins (polls SCM, 60s)
    │  6. Sign            cosign sign + attach sbom
    │  7. Update GitOps   sed the tag into values.yaml, commit, push
    ▼
-git (helm/notes-app/values.yaml now names the new tag)
+git (helm/values.yaml now names the new tag)
    │
    ▼
 Argo CD  polls every 60s -> syncs the chart
@@ -2010,7 +2010,7 @@ or let `pollSCM` pick up the next push. Then watch the handoff:
 kubectl -n jenkins get pods -w
 
 # 2. the commit Jenkins wrote back
-git log --oneline -1 helm/notes-app/values.yaml   # chore(deploy): notes-app -> <sha> [ci skip]
+git log --oneline -1 helm/values.yaml   # chore(deploy): notes-app -> <sha> [ci skip]
 
 # 3. CD: Argo CD picks it up within 60s
 kubectl -n argocd get application notes-app -o jsonpath='{.status.sync.status} {.status.health.status}{"\n"}'

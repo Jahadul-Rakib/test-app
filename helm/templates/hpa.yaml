@@ -1,0 +1,81 @@
+{{- /*
+HorizontalPodAutoscaler -- created only when autoscaling.enabled.
+
+Needs metrics-server for the CPU/memory targets: if `kubectl top pods` does not
+work, the HPA reports <unknown> for every metric and never scales.
+
+workload.yaml drops `replicas` from the manifest whenever this is enabled, so
+Helm and the HPA are not both writing the same field. Without that, every Argo CD
+sync resets the replica count and the HPA scales it back up, forever.
+
+scaleTargetRef points at whatever workload.kind produced -- Argo Rollouts
+implements the scale subresource, so a Rollout autoscales like a Deployment.
+
+Self-contained: the preamble is the same four lines as every other template here.
+*/ -}}
+{{- $name := .Values.nameOverride | default .Chart.Name -}}
+{{- $fullname := .Values.fullnameOverride | default (ternary .Release.Name (printf "%s-%s" .Release.Name $name) (contains $name .Release.Name)) | trunc 63 | trimSuffix "-" -}}
+{{- $selector := dict "app.kubernetes.io/name" $name "app.kubernetes.io/instance" .Release.Name -}}
+{{- $labels := merge (dict "app.kubernetes.io/managed-by" .Release.Service "helm.sh/chart" (printf "%s-%s" .Chart.Name .Chart.Version) "app.kubernetes.io/version" (.Chart.AppVersion | toString)) $selector (.Values.commonLabels | default dict) -}}
+{{- $hpa := .Values.autoscaling | default dict -}}
+{{- $kind := (.Values.workload).kind | default "Deployment" -}}
+{{- if $hpa.enabled }}
+{{- if eq $kind "DaemonSet" }}
+{{-   fail "autoscaling.enabled is not valid with workload.kind DaemonSet -- a DaemonSet already runs exactly one pod per node" }}
+{{- end }}
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ $fullname }}
+  labels:
+    {{- toYaml $labels | nindent 4 }}
+  {{- with .Values.commonAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  scaleTargetRef:
+    apiVersion: {{ if eq $kind "Rollout" }}argoproj.io/v1alpha1{{ else }}apps/v1{{ end }}
+    kind: {{ $kind }}
+    name: {{ $fullname }}
+  minReplicas: {{ $hpa.minReplicas | default 1 }}
+  maxReplicas: {{ $hpa.maxReplicas | default 10 }}
+  {{- /* Guarded: `metrics:` with nothing under it is a null field, and an HPA
+         with no metrics at all never scales. Omit the key entirely and the API
+         server applies its own default (80% CPU) instead. */}}
+  {{- if or $hpa.targetCPUUtilizationPercentage $hpa.targetMemoryUtilizationPercentage $hpa.metrics }}
+  metrics:
+    {{- /* Utilization is a percentage of the container's REQUEST, not of a core.
+           With requests.cpu 50m, a target of 80 means "scale when average usage
+           passes 40m". A container with no CPU request makes this metric
+           unusable -- the HPA has nothing to take a percentage of. */}}
+    {{- with $hpa.targetCPUUtilizationPercentage }}
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ . }}
+    {{- end }}
+    {{- /* Memory is a poor scaling signal for anything with a cache or a JVM:
+           usage rises and never falls, so the HPA scales up and never back
+           down. 0 in values.yaml omits it. */}}
+    {{- with $hpa.targetMemoryUtilizationPercentage }}
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: {{ . }}
+    {{- end }}
+    {{- /* Custom or external metrics (queue depth, requests per second) need an
+           adapter -- Prometheus Adapter or KEDA. */}}
+    {{- with $hpa.metrics }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- end }}
+  {{- with $hpa.behavior }}
+  behavior:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+{{- end }}

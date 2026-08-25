@@ -1,0 +1,54 @@
+{{- /*
+PodDisruptionBudget -- created only when podDisruptionBudget.enabled.
+
+Guards against VOLUNTARY disruption only: `kubectl drain`, node upgrades, cluster
+autoscaler scale-down. It does nothing about a crash, an OOM kill, or a node
+dying -- those are involuntary and no budget can stop them.
+
+Where it earns its keep is GPU nodes: a driver upgrade means draining the node,
+and without a PDB every replica can be evicted at once.
+
+==> minAvailable equal to the replica count blocks drains completely. The node
+    never finishes draining and `kubectl drain` hangs until somebody notices.
+    With replicaCount 2, minAvailable 1 is the setting you want.
+
+Self-contained: the preamble is the same four lines as every other template here.
+*/ -}}
+{{- $name := .Values.nameOverride | default .Chart.Name -}}
+{{- $fullname := .Values.fullnameOverride | default (ternary .Release.Name (printf "%s-%s" .Release.Name $name) (contains $name .Release.Name)) | trunc 63 | trimSuffix "-" -}}
+{{- $selector := dict "app.kubernetes.io/name" $name "app.kubernetes.io/instance" .Release.Name -}}
+{{- $labels := merge (dict "app.kubernetes.io/managed-by" .Release.Service "helm.sh/chart" (printf "%s-%s" .Chart.Name .Chart.Version) "app.kubernetes.io/version" (.Chart.AppVersion | toString)) $selector (.Values.commonLabels | default dict) -}}
+{{- $pdb := .Values.podDisruptionBudget | default dict -}}
+{{- if $pdb.enabled }}
+{{- /* The API rejects both fields together, and rejects neither. Fail here with a
+       readable message instead of at apply time with a validation error. */}}
+{{- if and $pdb.minAvailable $pdb.maxUnavailable }}
+{{-   fail "podDisruptionBudget: set minAvailable OR maxUnavailable, not both" }}
+{{- end }}
+{{- if not (or $pdb.minAvailable $pdb.maxUnavailable) }}
+{{-   fail "podDisruptionBudget.enabled is true but neither minAvailable nor maxUnavailable is set" }}
+{{- end }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ $fullname }}
+  labels:
+    {{- toYaml $labels | nindent 4 }}
+  {{- with .Values.commonAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- /* Both accept an integer or a percentage string ("50%"). */}}
+  {{- with $pdb.minAvailable }}
+  minAvailable: {{ . }}
+  {{- end }}
+  {{- with $pdb.maxUnavailable }}
+  maxUnavailable: {{ . }}
+  {{- end }}
+  {{- /* Selects by the same labels the workload puts on its pods, so it covers
+         canary and stable pods alike during a Rollout. */}}
+  selector:
+    matchLabels:
+      {{- toYaml $selector | nindent 6 }}
+{{- end }}

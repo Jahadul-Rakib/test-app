@@ -1,0 +1,673 @@
+# =============================================================================
+# GENERIC APP CHART -- this file is the only one you edit.
+#
+# templates/ contains no app name, no port number and no probe path. Everything
+# app-specific lives here, so deploying a different app means editing values --
+# never touching a template.
+#
+# HOW IT DECIDES WHAT TO CREATE
+#
+#   give a block data         -> the resource is rendered
+#   leave it empty / {} / []  -> the resource is skipped entirely
+#
+# `config.env: {}` produces no ConfigMap. `secrets.env: {}` produces no Secret.
+# `extraManifests: []` produces nothing. Empty maps are also omitted from the
+# pod spec, so you never get a stray `nodeSelector: {}` in the output.
+#
+# `enabled` flags are the exception -- they gate things you may want off even
+# when configured: service, ingress, autoscaling, podDisruptionBudget,
+# serviceAccount.create, gpu.
+#
+# MINIMUM for a new app: nameOverride, image, ports, the two probes, and
+# ingress.hosts. Everything else has a working default.
+# =============================================================================
+
+# --- 1. Identity -------------------------------------------------------------
+
+# The app's name: lands in app.kubernetes.io/name, the label selector, and every
+# object name. Set this per app -- left blank you inherit the chart's own name
+# ("helm"), which means nothing on a cluster.
+nameOverride: notes-app
+
+# Object names are `<release>-<name>`, collapsed to just `<release>` when the
+# release name already contains the name -- so release `notes-app` + name
+# `notes-app` gives `notes-app`, not `notes-app-notes-app`. Set this to pin a
+# literal name and bypass that logic: useful when a rename would make Argo CD
+# prune and recreate live objects.
+fullnameOverride: ""
+
+# Merged into every object. These cannot overwrite the standard
+# app.kubernetes.io/* keys -- those always win, so a typo here can't break the
+# selector.
+commonLabels: { }
+commonAnnotations: { }
+
+# --- 2. Image ----------------------------------------------------------------
+
+# ==> REWRITTEN BY CI. The Jenkins 'Update GitOps' stage runs
+#       sed -i "s|^image:.*|image: $IMAGE_REPOSITORY:$IMAGE_TAG|"
+#     and then greps `^image: <repo>:<tag>$` to prove the edit landed. So this
+#     MUST stay a single-line scalar at column 0. Splitting it into
+#     image.repository / image.tag breaks the deploy stage.
+image: docker.io/jahadulrakib/notes-app:1d94ac6e1936b94f6531e828492da90a8937c526
+
+imagePullPolicy: IfNotPresent
+
+# EMPTY BY DEFAULT so the chart installs anywhere with no prior setup.
+#
+# A named secret must already exist IN THE POD'S NAMESPACE -- the kubelet reads
+# it, Helm never creates it. Naming one that does not exist is not a hard
+# failure (the kubelet falls back to an anonymous pull), which is exactly what
+# makes it a bad default: a PRIVATE image then fails as ImagePullBackOff, several
+# layers from the real cause.
+#   kubectl create secret docker-registry regcred -n <ns> \
+#     --docker-server=https://index.docker.io/v1/ \
+#     --docker-username=<user> --docker-password=<token>
+imagePullSecrets: [ ]
+
+# --- 3. Workload -------------------------------------------------------------
+
+workload:
+  # Deployment | Rollout | StatefulSet | DaemonSet.
+  #
+  # Rollout is the Argo Rollouts CRD -- it gives you the canary steps below, but
+  # it needs the CRDs installed (kubectl get crd rollouts.argoproj.io). On a
+  # cluster without them the install fails with
+  #   no matches for kind "Rollout" in version "argoproj.io/v1alpha1"
+  # so switch to Deployment there. Everything else in this file is identical
+  # across all four kinds.
+  kind: Rollout
+
+  # Ignored for DaemonSet (one pod per node) and whenever autoscaling.enabled --
+  # otherwise Helm and the HPA fight over the same field on every sync.
+  replicaCount: 2
+
+  # Old ReplicaSets/ReplicaSet-equivalents kept for rollback. 3 is enough to
+  # undo a bad deploy without hoarding history.
+  revisionHistoryLimit: 3
+
+  # Seconds a new pod must stay Ready before it counts as available. Raise it if
+  # your app passes its readiness probe and then falls over.
+  minReadySeconds: 0
+
+  # Pass-through for Deployment/StatefulSet/DaemonSet update strategy. Empty
+  # means the Kubernetes default (RollingUpdate). Ignored for Rollout -- use
+  # `canary` below.
+  #   strategy:
+  #     rollingUpdate: {maxSurge: 1, maxUnavailable: 0}
+  strategy: { }
+
+  # --- Rollout only ---
+  canary:
+    # maxUnavailable 0 + maxSurge 1 means the new pod must be Ready before an old
+    # one goes away, so a broken image never reduces capacity.
+    maxSurge: 1
+    maxUnavailable: 0
+
+    # Percentage of traffic to the canary at each step. `pause` without a
+    # duration waits forever until you `kubectl argo rollouts promote`.
+    steps:
+      - setWeight: 25
+      - pause: { duration: 10s }
+      - setWeight: 50
+      - pause: { duration: 10s }
+      - setWeight: 75
+      - pause: { duration: 10s }
+
+    # Real weighted traffic splitting via nginx. OFF because it needs a second
+    # (canary) Service and an ingress controller that honours the canary
+    # annotations. With it off, `setWeight` is approximated by pod counts --
+    # 25% means "one of four pods", which is close enough for a lab and wrong
+    # for anything that needs exact weights.
+    trafficRouting: false
+
+  # --- StatefulSet only ---
+  # OrderedReady starts/stops pods one at a time in ordinal order; Parallel does
+  # them all at once (faster, only safe if your app has no join order).
+  podManagementPolicy: OrderedReady
+
+  # Per-pod persistent storage. Each entry becomes a PVC named
+  # <name>-<pod>-<ordinal>. IMMUTABLE after creation -- to resize or change the
+  # class you delete the StatefulSet with --cascade=orphan and recreate it.
+  #   volumeClaimTemplates:
+  #     - metadata: {name: data}
+  #       spec:
+  #         accessModes: ["ReadWriteOnce"]
+  #         resources: {requests: {storage: 5Gi}}
+  volumeClaimTemplates: [ ]
+
+# --- 4. Container ------------------------------------------------------------
+
+# Override the image's ENTRYPOINT / CMD. Empty = use what the image declares,
+# which is what you want unless you are debugging.
+#   command: ["/bin/sh"]
+#   args: ["-c", "sleep infinity"]
+command: [ ]
+args: [ ]
+
+# Container ports. `name` is what service.targetPort and the probes below refer
+# to -- rename it and you must rename it in both places. Names are capped at 15
+# characters by Kubernetes.
+ports:
+  - name: http
+    containerPort: 8080
+    protocol: TCP
+
+# Plain literal env vars, injected directly into the container. For anything
+# that needs valueFrom (field refs, secret keys) use envRaw. For a shared block
+# of config that other pods also read, use config.env -- that becomes a
+# ConfigMap and is mounted with envFrom, so editing it doesn't rewrite the pod
+# spec (it does still restart pods, via the checksum annotation).
+env: { }
+
+# Raw env entries, passed through verbatim. Use for valueFrom.
+#   envRaw:
+#     - name: POD_IP
+#       valueFrom: {fieldRef: {fieldPath: status.podIP}}
+#     - name: DB_PASSWORD
+#       valueFrom: {secretKeyRef: {name: db, key: password}}
+envRaw: [ ]
+
+# Extra envFrom sources. The ConfigMap and Secret this chart renders are added
+# automatically -- this is for ones managed elsewhere (sealed-secrets, External
+# Secrets, another team's ConfigMap).
+#   extraEnvFrom:
+#     - secretRef: {name: notes-app-db}
+extraEnvFrom: [ ]
+
+# ==> PROBE PATHS MUST MATCH config.env.SCRIPT_NAME BELOW.
+#
+#     This app runs under gunicorn with SCRIPT_NAME=/app. gunicorn >=22 returns
+#     500 for any request path that does not start with SCRIPT_NAME -- so a probe
+#     on /healthz gets a 500, readiness never passes, liveness kills the
+#     container, and the pod sits in CrashLoopBackOff with a perfectly healthy
+#     app inside it. If you change SCRIPT_NAME, change these. If your app has no
+#     path prefix, drop the prefix here too.
+#
+#     Set either probe to {} to omit it. Any probe field Kubernetes accepts works
+#     here (exec, tcpSocket, grpc, failureThreshold, ...) -- this is a
+#     pass-through, not a fixed shape.
+livenessProbe:
+  httpGet:
+    path: /app/healthz
+    port: http
+  initialDelaySeconds: 5
+
+readinessProbe:
+  httpGet:
+    path: /app/healthz
+    port: http
+  initialDelaySeconds: 3
+
+# For slow starts. While a startupProbe is running the liveness probe is
+# suspended, which lets you keep liveness aggressive without killing a container
+# that is merely still booting. Worth setting for anything that loads a model.
+#   startupProbe:
+#     httpGet: {path: /app/healthz, port: http}
+#     failureThreshold: 30
+#     periodSeconds: 5
+startupProbe: { }
+
+# preStop is the one that matters for zero-downtime: it delays SIGTERM long
+# enough for the endpoint removal to propagate to every kube-proxy/ingress.
+#   lifecycle:
+#     preStop: {exec: {command: ["sleep", "5"]}}
+lifecycle: { }
+
+# requests = what the scheduler reserves; limits = what the kernel enforces.
+# A CPU limit throttles; a MEMORY limit OOM-kills. Both are set here because
+# unbounded pods are how one app takes down a node.
+# GPUs are NOT set here -- see the gpu block, which splices them into limits.
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    cpu: 200m
+    memory: 128Mi
+
+# Container-level security. EMPTY because a read-only root filesystem or a
+# forced non-root UID breaks images that were not built for it, and a chart
+# default that breaks images is worse than no default. Turn it on per app:
+#   securityContext:
+#     runAsNonRoot: true
+#     runAsUser: 10001
+#     allowPrivilegeEscalation: false
+#     readOnlyRootFilesystem: true
+#     capabilities: {drop: ["ALL"]}
+securityContext: { }
+
+# Mounts into the app container. config.files and secrets.files add their own
+# mounts automatically -- this is for volumes you declare under `volumes`.
+#   volumeMounts:
+#     - name: cache
+#       mountPath: /var/cache/app
+volumeMounts: [ ]
+
+# Run to completion before the app container starts. Ordered, and a failure
+# blocks the pod. Classic uses: schema migrations, waiting on a dependency,
+# chown-ing a volume.
+#   initContainers:
+#     - name: migrate
+#       image: docker.io/jahadulrakib/notes-app:latest
+#       command: ["python", "manage.py", "migrate"]
+initContainers: [ ]
+
+# Extra long-running containers alongside the app: log shipper, metrics
+# exporter, proxy. They share the pod's network and volumes.
+#   sidecars:
+#     - name: exporter
+#       image: nginx/nginx-prometheus-exporter:1.4.2
+#       ports: [{name: metrics, containerPort: 9113}]
+sidecars: [ ]
+
+# --- 5. Pod ------------------------------------------------------------------
+
+# Pod-level annotations/labels, merged with commonAnnotations/commonLabels.
+# Note the workload already carries a checksum/config annotation, so a ConfigMap
+# or Secret edit restarts pods without you adding anything here.
+podAnnotations: { }
+podLabels: { }
+
+# Applies to every container in the pod. fsGroup is the useful one: it chowns
+# mounted volumes to that GID so a non-root container can write to them.
+#   podSecurityContext:
+#     fsGroup: 10001
+podSecurityContext: { }
+
+# Volumes available to the pod. config.files / secrets.files add theirs
+# automatically.
+#   volumes:
+#     - name: cache
+#       emptyDir: {}
+volumes: [ ]
+
+# Simple "schedule me on nodes with these labels". The gpu block below merges
+# its own selector into this one, so you can use both.
+nodeSelector: { }
+
+# Lets the pod onto tainted nodes. The gpu block appends its own, so a GPU pod
+# tolerates the GPU taint without you repeating it here.
+tolerations: [ ]
+
+# The expressive version of nodeSelector: OR-ed requirements, preferences with
+# weights, and pod affinity/anti-affinity. Spread replicas across nodes with:
+#   affinity:
+#     podAntiAffinity:
+#       preferredDuringSchedulingIgnoredDuringExecution:
+#         - weight: 100
+#           podAffinityTerm:
+#             topologyKey: kubernetes.io/hostname
+#             labelSelector:
+#               matchLabels: {app.kubernetes.io/name: notes-app}
+affinity: { }
+
+# Even spread with a hard skew limit -- usually a better fit than
+# anti-affinity for "one per zone, but don't block scheduling".
+#   topologySpreadConstraints:
+#     - maxSkew: 1
+#       topologyKey: topology.kubernetes.io/zone
+#       whenUnsatisfiable: ScheduleAnyway
+#       labelSelector:
+#         matchLabels: {app.kubernetes.io/name: notes-app}
+topologySpreadConstraints: [ ]
+
+# Which container runtime handles this pod. On K3s the NVIDIA Container Toolkit
+# registers a `nvidia` RuntimeClass; without runtimeClassName: nvidia the pod
+# gets the default runtime, sees no /dev/nvidia* devices, and CUDA fails inside a
+# pod that Kubernetes considers perfectly healthy. Left at "" for CPU apps.
+# AMD and Intel need no RuntimeClass -- their device plugins pass through
+# /dev/kfd + /dev/dri and /dev/dri directly.
+runtimeClassName: ""
+
+# Preemption ordering under pressure. Needs an existing PriorityClass
+# (kubectl get priorityclass); naming a missing one makes the pod unschedulable.
+priorityClassName: ""
+
+# Grace period between SIGTERM and SIGKILL. Must exceed your preStop sleep plus
+# the app's real shutdown time, or in-flight requests get cut.
+terminationGracePeriodSeconds: 30
+
+# hostNetwork puts the pod on the node's network namespace: containerPort becomes
+# a real port on the host, and two replicas cannot land on the same node. Only
+# for node-level agents. If you set it, also set
+# dnsPolicy: ClusterFirstWithHostNet or the pod loses cluster DNS.
+hostNetwork: false
+dnsPolicy: ""
+
+# --- 6. GPU (any vendor) -----------------------------------------------------
+#
+# One switch. `enabled: false` renders an ordinary CPU workload with no GPU
+# resource, no GPU node selector and no GPU toleration -- identical to a chart
+# that had never heard of GPUs. `enabled: true` splices three things in:
+#
+#   1. resources.limits.<resourceName>: <count>
+#   2. the vendor's node label into nodeSelector
+#   3. the vendor's taint into tolerations
+#
+# The GPU goes into limits ONLY. Kubernetes copies extended resources from
+# limits into requests automatically, so the two can never drift; writing it in
+# both places is how you get a pod that reserves two GPUs and is allowed to use
+# one. Counts are whole devices -- there is no 0.5.
+#
+# `vendor` picks a preset (the same table as §0.3 of
+# ../gpu_node_setup/k3s_gpu_node_setup.md, so the guide and the chart agree).
+# Any field you set explicitly overrides the preset.
+#
+#   vendor    resourceName          node label
+#   nvidia    nvidia.com/gpu        nvidia.com/gpu.present=true
+#   amd       amd.com/gpu           feature.node.kubernetes.io/amd-gpu=true
+#   intel     gpu.intel.com/i915    gpu.intel.com/i915=true
+#
+# runtimeClassName is an NVIDIA-only concern -- leave it empty for AMD and Intel.
+# NVIDIA on K3s needs `runtimeClassName: nvidia` because the NVIDIA Container
+# Toolkit registers a containerd runtime that injects the driver libraries. AMD
+# and Intel register no runtime at all: their device plugins simply mount the
+# device files into the pod (/dev/kfd + /dev/dri for ROCm, /dev/dri for Intel)
+# and the userspace stack lives in the image. Copying the NVIDIA value onto an
+# AMD node does not degrade gracefully -- every pod is rejected at admission
+# with `RuntimeClass "nvidia" not found`, which reads like a scheduling bug.
+#
+# Intel Arc / Data Center Max on a kernel >=6.8 may expose the xe driver instead
+# of i915 -- check `kubectl get nodes -o json | grep gpu.intel.com` and set
+# resourceName: gpu.intel.com/xe if that is what you see.
+gpu:
+  enabled: false
+
+  # nvidia | amd | intel
+  vendor: nvidia
+
+  # Leave empty to take the vendor preset. Set it to override, and note that
+  # `count` below is then denominated in whatever you name here:
+  #   nvidia  nvidia.com/mig-1g.5gb   one MIG slice, NOT a whole A100/H100.
+  #                                   Each profile is its own resource name, so
+  #                                   the scheduler treats slices and whole
+  #                                   cards as different, non-fungible things.
+  #   amd     amd.com/gpu             normally leave empty. ROCm exposes a
+  #                                   single resource name with no MIG-style
+  #                                   per-profile variants, so on AMD you ask
+  #                                   for *more of the same* name rather than a
+  #                                   different one.
+  #   intel   gpu.intel.com/xe        Arc / Data Center Max on kernel >=6.8.
+  resourceName: ""
+
+  # Whole devices. Asking for more than any single node has makes the pod
+  # permanently Pending with "Insufficient <resourceName>" -- the scheduler
+  # cannot add GPUs across nodes.
+  count: 1
+
+  # Leave empty to take the vendor's node label. Set it to target something
+  # narrower -- a specific model, or a specific node pool:
+  #   nvidia  {nvidia.com/gpu.product: NVIDIA-A100-SXM4-40GB}
+  #             GPU Feature Discovery applies .product / .memory / .compute.major
+  #   amd     {amd.com/gpu.device-id: "74a1"}
+  #             the AMD node labeller (rocm/k8s-device-plugin:labeller) applies
+  #             .device-id / .family / .vram / .cu-count
+  #   intel   {gpu.intel.com/device-id.0300-56a0.present: "true"}
+  #             NFD applies these from the PCI device id
+  #
+  # Label names and values vary by plugin version, so read them off the node
+  # rather than trusting this list -- for AMD:
+  #   kubectl get node <node> -o json | jq '.metadata.labels
+  #     | with_entries(select(.key | startswith("amd.com")))'
+  #
+  # If NFD / GFD / the labeller is not running, NONE of those labels exist and a
+  # selector using one leaves the pod Pending forever. That is why the setup
+  # guide also applies a plain label by hand -- fall back to {gpu.vendor: amd}.
+  nodeSelector: { }
+
+  # Leave empty for the vendor default: tolerate <resourceName>=present:NoSchedule,
+  # the taint the setup guide puts on GPU nodes to keep CPU workloads off them.
+  # The key tracks resourceName, so it differs per vendor:
+  #   nvidia  nvidia.com/gpu=present:NoSchedule
+  #   amd     amd.com/gpu=present:NoSchedule
+  #   intel   gpu.intel.com/i915=present:NoSchedule
+  # Set this only if you taint your nodes differently. Remember a toleration is
+  # permission, not placement: it never pulls a pod onto a GPU node, which is
+  # exactly why nodeSelector above is required as well.
+  tolerations: [ ]
+
+  # Vendor env vars merged into the container only when GPUs are enabled, so a
+  # CPU render stays clean.
+  #
+  #   NVIDIA / CUDA
+  #     NVIDIA_VISIBLE_DEVICES: all             # usually set by the device plugin
+  #     NVIDIA_DRIVER_CAPABILITIES: compute,utility
+  #
+  #   AMD / ROCm
+  #     HIP_VISIBLE_DEVICES: "0"                # pick one of several cards
+  #     HSA_OVERRIDE_GFX_VERSION: "11.0.0"
+  #       The one AMD-specific thing worth knowing. Consumer Radeon cards report
+  #       a gfx target ROCm ships no kernels for, and PyTorch then dies at init
+  #       ("invalid device function" / "no kernel image is available") on a pod
+  #       that scheduled and started perfectly -- so it looks like an app bug,
+  #       not a GPU one. Spoofing the target here rather than baking it into the
+  #       image lets one image serve several card types. Values follow the card's
+  #       LLVM target: "11.0.0" for RDNA3, "10.3.0" for RDNA2. See step 13 of
+  #       ../gpu_node_setup/k3s_gpu_node_setup.md.
+  #
+  #   Intel / oneAPI
+  #     ZE_AFFINITY_MASK: "0"                   # Level Zero device selection
+  env: { }
+
+# --- 7. Service --------------------------------------------------------------
+
+service:
+  # false = no Service at all. Correct for a worker or cron-style app that
+  # nothing connects to.
+  enabled: true
+
+  # ClusterIP (in-cluster only) | NodePort | LoadBalancer.
+  # The Ingress below reaches a ClusterIP fine -- you rarely need more.
+  type: ClusterIP
+
+  # Port the Service listens on.
+  port: 80
+
+  # Where it forwards to: a port NAME from `ports` above (survives a container
+  # port change) or a number.
+  targetPort: http
+
+  # Fixed 30000-32767 port on every node, for type: NodePort. Empty = random.
+  nodePort: ""
+
+  # Forced on for StatefulSet regardless (a StatefulSet needs a headless Service
+  # to give each pod its stable DNS name). Set true for a Deployment when you
+  # want per-pod DNS instead of a load-balanced VIP -- e.g. a client-side
+  # balancing gRPC library.
+  headless: false
+
+  # e.g. MetalLB address pools, cloud LB tuning.
+  annotations: { }
+
+  # Additional ports on the same Service.
+  #   extraPorts:
+  #     - name: metrics
+  #       port: 9113
+  #       targetPort: metrics
+  extraPorts: [ ]
+
+# --- 8. Ingress --------------------------------------------------------------
+
+ingress:
+  enabled: true
+
+  # Must match an installed IngressClass (kubectl get ingressclass). A wrong or
+  # empty className means no controller claims the Ingress: it is created, has no
+  # ADDRESS, and nothing serves it.
+  className: nginx
+
+  # NOTE: there is deliberately no rewrite-target annotation. This app is served
+  # under /app by gunicorn's SCRIPT_NAME, so nginx must pass the prefix through
+  # untouched. Adding a rewrite here would strip /app and gunicorn would 500 on
+  # every request. An app that expects requests at / needs the opposite:
+  #   annotations:
+  #     nginx.ingress.kubernetes.io/rewrite-target: /$2
+  #   and a path of /app(/|$)(.*) with pathType: ImplementationSpecific.
+  annotations: { }
+
+  # host: "" matches any hostname -- fine for a lab reached by IP. Set a real
+  # host for anything shared, and note that TLS below needs one.
+  # Multiple hosts and multiple paths per host are both supported.
+  hosts:
+    - host: ""
+      paths:
+        - path: /app
+          pathType: Prefix
+
+  # Each entry needs a Secret of type kubernetes.io/tls in this namespace,
+  # holding tls.crt + tls.key. cert-manager creates it for you if you add its
+  # annotation above; otherwise create it yourself.
+  #   tls:
+  #     - secretName: notes-app-tls
+  #       hosts: [notes.example.com]
+  tls: [ ]
+
+# --- 9. ConfigMap ------------------------------------------------------------
+#
+# No `enabled` flag: pass data and the ConfigMap appears, leave it empty and
+# nothing is created. Both are optional and independent.
+config:
+  # Becomes a ConfigMap wired in with envFrom -- every key is an env var. Keys
+  # must be valid env var names (A-Z, 0-9, _); a key with a dash is silently
+  # dropped by the kubelet.
+  env:
+    APP_TITLE: Notes
+    APP_ENV: local
+    # ==> Keep in sync with the probe paths in §4. gunicorn 500s on any request
+    #     whose path does not start with this.
+    SCRIPT_NAME: /app
+
+  # Becomes a second ConfigMap, mounted as files at mountPath. Key = filename,
+  # value = contents. Use `|` for multi-line.
+  #   files:
+  #     settings.yaml: |
+  #       feature_flags:
+  #         beta: true
+  files: { }
+
+  # Where `files` lands. Mounting over a directory that the image already
+  # populates hides the original contents.
+  mountPath: /etc/notes-app
+
+# --- 10. Secret --------------------------------------------------------------
+#
+# ==> SHIPS EMPTY ON PURPOSE. values.yaml is committed to git, and a Kubernetes
+#     Secret is base64 -- encoding, not encryption. Anything you put here is
+#     readable by anyone with repo access, forever, including in history.
+#
+#     For real credentials, keep them out of this file and reference a Secret
+#     created elsewhere:
+#       extraEnvFrom: [{secretRef: {name: notes-app-db}}]
+#     with sealed-secrets, External Secrets Operator, or a one-off
+#       kubectl create secret generic notes-app-db --from-literal=...
+#
+#     These two keys exist so the chart is complete -- use them for
+#     non-production values only.
+secrets:
+  # Plaintext in, base64 in the manifest, wired in with envFrom.
+  env: { }
+
+  # Key = filename, value = contents. Mounted at mountPath, mode 0400.
+  files: { }
+  mountPath: /etc/secrets
+
+# --- 11. ServiceAccount ------------------------------------------------------
+
+serviceAccount:
+  # false = the pod uses the namespace's `default` ServiceAccount. Set true when
+  # the app calls the Kubernetes API, or when it needs cloud identity (IRSA /
+  # Workload Identity) bound to a dedicated account.
+  # Creating the account grants no permissions on its own -- add a Role and
+  # RoleBinding via extraManifests below.
+  create: false
+
+  # Empty + create: true  -> named after the release.
+  # Empty + create: false -> "default".
+  # Set it to use an account somebody else manages.
+  name: ""
+
+  # Where the cloud identity annotation goes:
+  #   eks.amazonaws.com/role-arn: arn:aws:iam::123456789012:role/notes-app
+  annotations: { }
+
+  # false stops Kubernetes mounting the API token into the pod. Do that for any
+  # app that never talks to the API -- it removes a credential from the
+  # container filesystem.
+  automount: true
+
+# --- 12. Autoscaling ---------------------------------------------------------
+
+autoscaling:
+  # Needs metrics-server for CPU/memory targets
+  # (kubectl top pods must work, or the HPA reports <unknown> and does nothing).
+  #
+  # When enabled, workload.replicaCount is dropped from the manifest so Helm and
+  # the HPA are not both writing `replicas` on every sync -- otherwise each Argo
+  # CD sync resets the count and the HPA scales it back up, forever.
+  enabled: false
+
+  minReplicas: 2
+  maxReplicas: 10
+
+  # Percentage of the CPU *request* (50m here), not of a core. Set to 0 to drop
+  # the CPU metric.
+  targetCPUUtilizationPercentage: 80
+
+  # 0 = omitted. Memory is a poor scaling signal for anything with a cache or a
+  # JVM -- usage rises and never falls, so the HPA scales up and never back down.
+  targetMemoryUtilizationPercentage: 0
+
+  # Raw metrics entries, appended to the two above. For custom/external metrics
+  # (queue depth, requests per second) you need an adapter such as Prometheus
+  # Adapter or KEDA.
+  #   metrics:
+  #     - type: Pods
+  #       pods:
+  #         metric: {name: http_requests_per_second}
+  #         target: {type: AverageValue, averageValue: "100"}
+  metrics: [ ]
+
+  # Scaling rate limits. The default already waits 5 minutes before scaling down;
+  # set this to make it slower still, or to make scale-up burstier.
+  #   behavior:
+  #     scaleDown: {stabilizationWindowSeconds: 600}
+  behavior: { }
+
+# --- 13. PodDisruptionBudget -------------------------------------------------
+
+podDisruptionBudget:
+  # Guards against VOLUNTARY disruption only -- `kubectl drain`, node upgrades,
+  # cluster autoscaler. It does not protect against crashes or a node dying.
+  #
+  # This matters most on GPU nodes: driver upgrades mean draining, and without a
+  # PDB every replica can be evicted at once.
+  enabled: false
+
+  # Set exactly ONE of these -- both is a validation error.
+  #
+  # WARNING: minAvailable equal to your replica count blocks drains completely.
+  # The node never finishes draining, and `kubectl drain` hangs until you notice.
+  # With replicaCount 2, minAvailable 1 is the useful setting.
+  minAvailable: 1
+  maxUnavailable: ""
+
+# --- 14. Anything else -------------------------------------------------------
+#
+# Arbitrary manifests, rendered with the chart's values in scope -- so
+# {{ .Release.Namespace }} and {{ .Values.nameOverride }} work inside them. This
+# is the escape hatch for the resources this chart has no opinion about: RBAC,
+# NetworkPolicy, ServiceMonitor, PVC, CronJob, VerticalPodAutoscaler.
+#
+#   extraManifests:
+#     - apiVersion: monitoring.coreos.com/v1
+#       kind: ServiceMonitor
+#       metadata:
+#         name: notes-app
+#       spec:
+#         selector:
+#           matchLabels:
+#             app.kubernetes.io/name: {{ .Values.nameOverride }}
+#         endpoints:
+#           - port: metrics
+extraManifests: [ ]

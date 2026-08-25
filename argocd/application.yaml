@@ -1,4 +1,4 @@
-# Keeps the `default` namespace matching helm/notes-app on main.
+# Keeps the `default` namespace matching helm/ on main.
 # Setup and prerequisites: abc_local_setup/local-kind-setup.md
 apiVersion: argoproj.io/v1alpha1
 kind: Application
@@ -12,7 +12,7 @@ spec:
   source:
     repoURL: https://github.com/Jahadul-Rakib/test-app.git
     targetRevision: main
-    path: helm/notes-app
+    path: helm
     helm:
       valueFiles:
         - values.yaml

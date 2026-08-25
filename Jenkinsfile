@@ -101,9 +101,11 @@ spec:
         GIT_CREDENTIALS_ID = 'github-token'
 
         // Helm / GitOps
+        // One generic chart at helm/ serves any app -- the app's identity lives
+        // in values.yaml (nameOverride + image), not in the chart path.
         HELM_RELEASE = 'notes-app'
-        HELM_CHART_DIR = 'helm/notes-app'
-        HELM_VALUES_FILE = 'helm/notes-app/values.yaml'
+        HELM_CHART_DIR = 'helm'
+        HELM_VALUES_FILE = 'helm/values.yaml'
 
         // CI
         CI_BOT_NAME = 'jenkins-ci'

@@ -82,7 +82,7 @@ side, and why installing PyTorch on the host buys nothing.
 ## 0.3 The naming contract
 
 Fixed for the rest of this doc. These exact names are what
-[`helm/notes-app/values.yaml`](../helm/notes-app/values.yaml) already ships, so
+[`helm/values.yaml`](../helm/values.yaml) already ships, so
 guide and chart agree.
 
 | | NVIDIA | AMD | Intel |
@@ -486,7 +486,7 @@ difference from the kubeadm path, where you either run
 
 > **K3s registers the NVIDIA runtime but does not make it the default.** Every GPU
 > pod therefore needs `runtimeClassName: nvidia` in its spec. That is what the
-> `runtimeClassName` value in [`helm/notes-app/values.yaml`](../helm/notes-app/values.yaml)
+> `runtimeClassName` value in [`helm/values.yaml`](../helm/values.yaml)
 > is for — set it to `nvidia` on this cluster.
 >
 > To avoid it, start the agent with `--default-runtime nvidia` (in
@@ -944,7 +944,7 @@ spec:
 > Whole devices only. `nvidia.com/gpu: 0.5` is rejected. To share, see
 > [step 14](#14-sharing-one-gpu).
 
-`helm/notes-app` renders all four from one block — see
+`helm` renders all four from one block — see
 [step 18](#18-helm-values-the-gpu-block).
 
 ## 13. The container image contract
@@ -1091,7 +1091,7 @@ stages** — only the deltas below.
    │  helm    template + lint                                      │
    │  crane   push the scanned tarball                             │
    │  cosign  sign + attach SBOM                                   │
-   │  git     bump image: in helm/notes-app/values.yaml  [ci skip] │
+   │  git     bump image: in helm/values.yaml  [ci skip] │
    └───────────────────────────┬───────────────────────────────────┘
                                ▼
                      GitOps repo (values.yaml)
@@ -1115,7 +1115,7 @@ first time.
 | # | Change | Where |
 |---|---|---|
 | 1 | GPU base image | `Dockerfile` — [step 13](#13-the-container-image-contract) |
-| 2 | `gpu.enabled=true` (+ `runtimeClassName` on NVIDIA) | `helm/notes-app/values.yaml` |
+| 2 | `gpu.enabled=true` (+ `runtimeClassName` on NVIDIA) | `helm/values.yaml` |
 | 3 | **Raise kaniko's memory + ephemeral storage** | `Jenkinsfile` pod template |
 | 4 | **Expect the Trivy gate to fail** | `Jenkinsfile` / base-image choice |
 
@@ -1158,22 +1158,22 @@ Everything else already generalises — `IMAGE_REPOSITORY`, the shared
 `DOCKER_CONFIG`, the tarball hand-off, the `sed` that bumps `values.yaml`, the
 `[ci skip]` token that stops the deploy commit re-triggering the build. If the
 GPU app is a **second** app rather than a change to `notes-app`, copy the pipeline
-and change four variables:
+and change two variables — the chart directory is shared:
 
 ```groovy
-APP_NAME         = 'gpu-inference'
-HELM_CHART_DIR   = 'helm/gpu-inference'
-HELM_VALUES_FILE = 'helm/gpu-inference/values.yaml'
-HELM_RELEASE     = 'gpu-inference'
+APP_NAME     = 'gpu-inference'
+HELM_RELEASE = 'gpu-inference'
+// HELM_CHART_DIR / HELM_VALUES_FILE stay at helm/ -- one generic chart, or copy
+// it to helm-gpu/ if the two apps need to diverge.
 ```
 
-`helm/notes-app` is already generic — `_helpers.tpl` derives every name from
-`.Chart`/`.Release` and the `gpu:` block is vendor-agnostic — so copying the chart
-directory and editing `Chart.yaml` is the whole port.
+`helm/` is already generic: nothing in `templates/` names an app, every name
+derives from `nameOverride` + `.Release`, and the `gpu:` block is
+vendor-agnostic. Porting is `nameOverride` + `image` in `values.yaml`.
 
 ## 18. Helm values: the GPU block
 
-[`helm/notes-app/values.yaml`](../helm/notes-app/values.yaml) already carries this,
+[`helm/values.yaml`](../helm/values.yaml) already carries this,
 off by default. Turning it on is the entire deploy-side change:
 
 ```yaml
@@ -1182,36 +1182,49 @@ runtimeClassName: nvidia
 
 gpu:
   enabled: true
-  resourceName: nvidia.com/gpu     # amd.com/gpu · gpu.intel.com/i915 · /xe
+  vendor: nvidia      # nvidia · amd · intel — picks resourceName + node label
   count: 1
-  nodeSelector:
-    nvidia.com/gpu.present: "true" # or gpu.vendor: <vendor>
-  tolerations:
-    - key: nvidia.com/gpu          # amd.com/gpu · gpu.intel.com/i915
-      operator: Exists
-      effect: NoSchedule
 ```
 
-`_helpers.tpl` merges `gpu.nodeSelector` into `nodeSelector`, concatenates
-`gpu.tolerations` onto `tolerations`, and splices `resourceName: count` into
-`resources.limits` — so all four requirements from
+`vendor` selects the preset from [§0.3](#03-the-naming-contract); anything you set
+explicitly overrides it:
+
+```yaml
+gpu:
+  enabled: true
+  resourceName: nvidia.com/mig-1g.5gb   # amd.com/gpu · gpu.intel.com/i915 · /xe
+  count: 1
+  nodeSelector:
+    nvidia.com/gpu.product: NVIDIA-A100-SXM4-40GB
+  tolerations:
+    - key: nvidia.com/gpu
+      operator: Exists
+      effect: NoSchedule
+  env:
+    HIP_VISIBLE_DEVICES: "0"            # merged only when enabled
+```
+
+`templates/workload.yaml` merges `gpu.nodeSelector` into `nodeSelector`,
+concatenates `gpu.tolerations` onto `tolerations`, and splices
+`resourceName: count` into `resources.limits` — so all four requirements from
 [step 12](#12-what-a-gpu-pod-needs) come from one flag and cannot disagree.
 
-**Switching vendor is three values**: `resourceName` and the two scheduling keys,
-plus dropping `runtimeClassName` for AMD/Intel. Nothing in the templates names
-NVIDIA.
+**Switching vendor is one value**: `gpu.vendor`, plus dropping `runtimeClassName`
+for AMD/Intel. Nothing in the templates names NVIDIA. An unknown vendor with no
+explicit `resourceName` fails the render with a message rather than shipping a
+GPU-less pod.
 
 Render before committing:
 
 ```sh
-helm template notes-app helm/notes-app \
+helm template notes-app helm \
   --set gpu.enabled=true --set runtimeClassName=nvidia \
   | grep -A6 -E 'runtimeClassName|nvidia.com/gpu'
 ```
 
-> **Canary + GPUs need a replica check.** `rollout.maxSurge: 1` means one extra
-> pod during a canary, and each replica takes a whole GPU. On a single-GPU node a
-> 1-replica Rollout cannot surge — the canary pod sits `Pending` on
+> **Canary + GPUs need a replica check.** `workload.canary.maxSurge: 1` means one
+> extra pod during a canary, and each replica takes a whole GPU. On a single-GPU
+> node a 1-replica Rollout cannot surge — the canary pod sits `Pending` on
 > *"Insufficient nvidia.com/gpu"* and the rollout stalls until it times out.
 > Either enable sharing ([step 14](#14-sharing-one-gpu)), set `maxSurge: 0` with
 > `maxUnavailable: 1` (brief downtime, correct on scarce hardware), or keep a

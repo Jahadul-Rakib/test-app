@@ -21,7 +21,7 @@ every step is *pull*-based rather than push-based.
               └─────────────────────────────────────────────┘
                    │                              │
        push image  │                              │  commit new tag into
-                   ▼                              ▼  helm/notes-app/values.yaml
+                   ▼                              ▼  helm/values.yaml
              Docker Hub                        GitHub
                    │                              │
                    │                              │  Argo CD polls every 60s
@@ -90,7 +90,7 @@ prefix left on. Details and the full setup are in
 | `app.py`, `templates/` | The Flask app |
 | `Dockerfile` | Runtime image |
 | `Jenkinsfile` | The CI pipeline |
-| `helm/notes-app/` | The chart Argo CD renders (a Rollout, not a Deployment) |
+| `helm/` | Generic app chart Argo CD renders — `workload.kind: Rollout` by default |
 | `argocd/application.yaml` | Tells Argo CD what to watch |
 | `k3s-lab/README.md` | **3-node K3s on OrbStack** — cluster, addons, Jenkins + Argo CD, end to end |
 | `abc_local_setup/cosign/cosign.*` | Signing keypair (see the note in the setup doc) |
@@ -132,44 +132,63 @@ Against a real cluster the kind steps apply minus the kind-specific ingress and
 image side-loading; the Argo CD, Argo Rollouts and Kyverno installs carry over
 verbatim.
 
-## Reusable templates (copy-paste, no dependency)
+## Reusable chart (copy-paste, no dependency)
 
-Two files are written to be **copied into another chart as-is**:
+`helm/` is a **generic app chart**. Nothing under `templates/` names an app: the
+name comes from `nameOverride`, the image from `image`, the ports and probe paths
+from values. To deploy a different app you copy `values.yaml` and edit it — you do
+not touch a template.
 
-| File | Provides |
+| File | Renders |
 |---|---|
-| `helm/notes-app/templates/_helpers.tpl` | `common.name`, `common.fullname`, `common.labels`, `common.selectorLabels`, `common.configMapName`, `common.filesConfigMapName`, `common.nodeSelector`, `common.tolerations`, `common.resources` |
-| `helm/notes-app/templates/configmap.yaml` | the env + files ConfigMaps |
+| `helm/templates/workload.yaml` | Deployment, Rollout, StatefulSet or DaemonSet — `workload.kind` picks |
+| `helm/templates/service.yaml` | stable Service, plus headless (StatefulSet) and canary (traffic routing) |
+| `helm/templates/ingress.yaml` | multi-host, multi-path, optional TLS |
+| `helm/templates/configmap.yaml` | env + files ConfigMaps |
+| `helm/templates/secret.yaml` | env + files Secrets |
+| `helm/templates/serviceaccount.yaml`, `hpa.yaml`, `pdb.yaml` | one optional resource each |
+| `helm/templates/extra.yaml` | arbitrary manifests from `extraManifests` |
 
 ```sh
-cp helm/notes-app/templates/_helpers.tpl   ../other-project/helm/myapp/templates/
-cp helm/notes-app/templates/configmap.yaml ../other-project/helm/myapp/templates/
+cp -r helm ../other-project/helm
+# then edit ../other-project/helm/values.yaml -- nameOverride, image, ports, probes
 ```
 
-That is the whole procedure — no `dependencies:` in `Chart.yaml`, no
-`Chart.lock`, no `helm dependency build`, nothing vendored under `charts/`.
+**Pass data, get a resource.** Nothing is created "just in case":
 
-Three properties make this safe:
+| Resource | Created when |
+|---|---|
+| workload | always |
+| Service / headless / canary | `service.enabled` / `kind: StatefulSet` / `workload.canary.trafficRouting` |
+| Ingress | `ingress.enabled` |
+| ConfigMap env / files | `config.env` / `config.files` non-empty |
+| Secret env / files | `secrets.env` / `secrets.files` non-empty |
+| ServiceAccount | `serviceAccount.create` |
+| HPA / PDB | `autoscaling.enabled` / `podDisruptionBudget.enabled` |
+| anything else | `extraManifests` non-empty |
 
-- **No chart-specific names.** Helpers are defined as `common.*` and every value
-  derives from `.Chart` / `.Release`, so the copy picks up the new chart's name
-  and release automatically. Nothing needs find-and-replace after a copy.
-- **Every values block is optional.** `gpu`, `config`, `nodeSelector`,
-  `tolerations` and `resources` are all read through `| default` guards, so a
-  chart that defines none of them still renders. Without those guards a missing
-  block fails with `nil pointer evaluating interface {}.enabled`, which is the
-  usual reason a copied helper file explodes in its new home.
-- **The full contract is at the top of `_helpers.tpl`**, so the copy carries its
-  own documentation.
+Three properties make a single template file safe to lift out on its own:
 
-`configmap.yaml` depends on `_helpers.tpl` — take both or neither. If you rename
-`configmap.yaml` in the destination chart, update the path in the
-`checksum/config` annotation in `rollout.yaml`, which hashes it **by path**;
-otherwise config changes silently stop restarting pods.
+- **No `_helpers.tpl`.** Each template opens with the same four-line preamble
+  computing `$name`, `$fullname`, `$selector` and `$labels`. The repetition is the
+  point: any one file can be dropped into another chart and still render. Change
+  the naming rule and you change it in every file — `grep '$fullname :='`.
+- **No chart-specific names.** Every value derives from `.Chart` / `.Release` /
+  `nameOverride`, so a copy picks up the new chart's name automatically.
+- **Every values block is optional.** Each is read through a `| default` guard, so
+  a chart whose `values.yaml` omits `gpu`, `config`, `secrets` or `workload`
+  entirely still renders. Without those guards a missing block fails with
+  `nil pointer evaluating interface {}.enabled`, the usual reason a copied
+  template explodes in its new home.
+
+`workload.yaml` hashes `configmap.yaml` and `secret.yaml` **by path** into
+`checksum/config` and `checksum/secret`. Rename either file in a destination chart
+and update those two paths, or config changes silently stop restarting pods.
 
 ## Configuration and scheduling
 
-`helm/notes-app/values.yaml` carries three blocks beyond the app itself:
+`helm/values.yaml` is sectioned and commented end to end. The blocks beyond the
+app itself:
 
 - **`config`** — renders `templates/configmap.yaml`. `config.env` becomes
   environment variables via `envFrom` (the app reads `APP_TITLE`/`APP_ENV` and
@@ -179,34 +198,44 @@ otherwise config changes silently stop restarting pods.
   ConfigMap into a `checksum/config` annotation — without it a config edit
   changes nothing in the pod spec, so no rollout is triggered and the pods keep
   serving the old values.
-- **`nodeSelector` / `tolerations` / `affinity` / `runtimeClassName`** — generic
-  placement, empty by default and omitted from the rendered pod spec.
-- **`gpu`** — off by default. Enabling it adds `nvidia.com/gpu` to the container
-  **limits** (extended resources are limits-only and whole devices only), merges
-  the GPU node selector, and appends the toleration for a
-  `nvidia.com/gpu=present:NoSchedule` taint. All three are required: the limit
-  alone leaves the pod `Pending`, and the selector alone leaves it running
-  without a GPU. Details in `local-kind-setup.md` step 10.5.
+- **`secrets`** — same two shapes, and ships empty. A Kubernetes Secret is
+  base64, which is encoding, not encryption: anything put here is committed to
+  git. Real credentials belong in a Secret created elsewhere and referenced with
+  `extraEnvFrom`.
+- **`nodeSelector` / `tolerations` / `affinity` / `topologySpreadConstraints` /
+  `runtimeClassName`** — generic placement, empty by default and omitted from the
+  rendered pod spec.
+- **`gpu`** — off by default, and vendor-agnostic. `gpu.vendor` (`nvidia`, `amd`,
+  `intel`) selects the resource name and node label; anything set explicitly
+  overrides the preset. Enabling it adds the GPU to the container **limits**
+  (extended resources are limits-only and whole devices only), merges the vendor
+  node selector, and appends the toleration for the GPU taint. All three are
+  required: the limit alone leaves the pod `Pending`, and the selector alone
+  leaves it running without a GPU. Details in `local-kind-setup.md` step 10.5 and
+  `gpu_node_setup/k3s_gpu_node_setup.md`.
+- **`serviceAccount` / `autoscaling` / `podDisruptionBudget` /
+  `extraManifests`** — all off or empty by default.
 
 ## Canary deployment (Argo Rollouts)
 
-The workload is a **Rollout**, not a Deployment. The Argo Rollouts
-controller owns the ReplicaSets and steps a new image through a canary,
-pausing at 25/50/75% — configured under `rollout.canary.steps` in
-`helm/notes-app/values.yaml`.
+The workload is a **Rollout**, not a Deployment — `workload.kind` in
+`helm/values.yaml`, which also accepts `Deployment`, `StatefulSet` and
+`DaemonSet`. The Argo Rollouts controller owns the ReplicaSets and steps a new
+image through a canary, pausing at 25/50/75% — configured under
+`workload.canary.steps`.
 
 ### The replica-count trap
 
-With `rollout.trafficRouting.enabled: false` (the default), **`setWeight` is
-approximated by replica count**. At `replicaCount: 1` there is no such thing as
-25% — the canary is one whole pod, which is 100% of your traffic. The steps
-above are meaningless until you either raise `replicaCount` to at least 4, or
-turn on traffic routing.
+With `workload.canary.trafficRouting: false` (the default), **`setWeight` is
+approximated by replica count**. At `workload.replicaCount: 1` there is no such
+thing as 25% — the canary is one whole pod, which is 100% of your traffic. The
+steps above are meaningless until you either raise `workload.replicaCount` to at
+least 4, or turn on traffic routing.
 
-With `trafficRouting.enabled: true`, nginx splits real request percentages
-regardless of replica count. That path needs `ingress.enabled: true`, because
-Rollouts steers traffic by rewriting the stable Ingress, and it renders a second
-`-canary` Service for nginx to split against.
+With `workload.canary.trafficRouting: true`, nginx splits real request
+percentages regardless of replica count. That path needs `ingress.enabled: true`,
+because Rollouts steers traffic by rewriting the stable Ingress, and it renders a
+second `-canary` Service for nginx to split against.
 
 ### Why `ignoreDifferences` is in application.yaml
 
@@ -239,9 +268,13 @@ verification of its own.
 The keypair lives in `abc_local_setup/cosign/`, and its public half is written
 verbatim into the Kyverno policy in the setup doc.
 
-> Both private files are **committed to this repo**, deliberately, so the demo
-> is reproducible from a clone. Wrong for anything real: anyone with read access
-> can sign images this cluster will trust.
+> **`cosign.key` and `cosign.password` are still tracked in this repo**, so the
+> demo is reproducible from a clone — and so anyone with read access can sign
+> images this cluster will trust. Before this is anything but a demo: `git rm
+> --cached` both, add them to `.gitignore`, and generate a fresh keypair, because
+> the old one stays reachable in git history. No other credential appears
+> anywhere in these documents; every token is read at the prompt with `read -rs`
+> or looked up by Jenkins credential ID.
 
 **Install cosign v2.x on the Jenkins agent, not v3.** The `Sign Image` stage
 passes `--tlog-upload=false`, which v3 removed, and the stage asserts the major
@@ -278,11 +311,14 @@ docker run -p 8080:8080 notes-app:latest
 ```
 
 ```bash
-helm lint helm/notes-app
-helm template notes-app helm/notes-app --set image=notes-app:latest
+helm lint helm
+helm template notes-app helm --set image=notes-app:latest
 ```
 
-Enable the ingress with `--set ingress.enabled=true --set ingress.host=notes.local`.
+The ingress is on by default at `/app` with no host. To pin a hostname, edit
+`ingress.hosts[0].host` in `helm/values.yaml` — not with `--set`, which replaces
+the whole list entry and drops its `paths` (the chart fails with a message saying
+so rather than rendering a broken Ingress).
 
 ## Routes
 
